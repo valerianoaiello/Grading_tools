@@ -1,10 +1,10 @@
 This a small collections of programs that I use within my lecturer duties.
 
-# Email Sender for Students  
+# Email Sender  
 
 This repository contains the first tool in a series of small Python utilities designed to assist with academic and administrative tasks.
 
-## 📧 Email Sender for Students
+## Email Sender 
 
 This script allows you to send **personalized emails** to students listed in a CSV file using the **Gmail API**.  
 Each email is sent **individually**, with optional attachments, and supports simple text customization.
