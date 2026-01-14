@@ -568,7 +568,6 @@ class PDFAnnotatorApp:
             self.save_state()
         self.root.quit()
 
-    def save_pdf(self, scores):
         """Salva il PDF con annotazioni e pagina di valutazione"""
         try:
             input_pdf = self.pdf_files[self.current_index]
@@ -710,6 +709,160 @@ class PDFAnnotatorApp:
             messagebox.showerror("Errore", f"Impossibile salvare il PDF: {str(e)}")
             return False
 
+    def save_pdf(self, scores):
+        """Salva il PDF con annotazioni e pagina di valutazione"""
+        try:
+            input_pdf = self.pdf_files[self.current_index]
+            reader = PdfReader(input_pdf)
+            writer = PdfWriter()
+
+            # Processa tutte le pagine
+            for page_num in range(1, self.total_pages + 1):
+                # Controlla se questa pagina ha annotazioni
+                if page_num in self.lines and self.lines[page_num]:
+                    # Converte la pagina a immagine ad alta risoluzione
+                    img = convert_from_path(
+                        input_pdf,
+                        first_page=page_num,
+                        last_page=page_num,
+                        dpi=400  # Alta risoluzione per meno sfocatura
+                    )[0]
+
+                    # Disegna le annotazioni sull'immagine
+                    draw = ImageDraw.Draw(img)
+                    page_lines = self.lines[page_num]
+                    
+                    for line in page_lines:
+                        if len(line) > 1:
+                            # Converti le coordinate del canvas alle coordinate dell'immagine originale
+                            img_width, img_height = img.size
+                            canvas_width, canvas_height = self.base_image.size
+                            
+                            scaled_line = []
+                            for (x, y) in line:
+                                # Scala le coordinate dal canvas all'immagine originale
+                                x_scaled = (x / canvas_width) * img_width
+                                y_scaled = (y / canvas_height) * img_height
+                                scaled_line.append((x_scaled, y_scaled))
+                            
+                            draw.line(scaled_line, fill="red", width=8)
+
+                    # Salva l'immagine con annotazioni come PDF
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as imgf:
+                        img.save(imgf.name, "PNG", dpi=(400, 400))
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as pdff:
+                        # Usa le dimensioni dell'immagine originale
+                        img_width, img_height = img.size
+                        # Converti da pixel a punti (72 punti per pollice)
+                        page_width = img_width * 72 / 400
+                        page_height = img_height * 72 / 400
+                        
+                        c = canvas.Canvas(pdff.name, pagesize=(page_width, page_height))
+                        c.drawImage(imgf.name, 0, 0, width=page_width, height=page_height)
+                        c.showPage()
+                        c.save()
+
+                    ann_page = PdfReader(pdff.name).pages[0]
+                    writer.add_page(ann_page)
+                    
+                    # Pulisci file temporanei
+                    os.unlink(imgf.name)
+                    os.unlink(pdff.name)
+                else:
+                    # Se non ci sono annotazioni, aggiungi la pagina originale
+                    writer.add_page(reader.pages[page_num - 1])
+
+            # Aggiungi la pagina di valutazione alla FINE
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as evalf:
+                c = canvas.Canvas(evalf.name, pagesize=A4)
+                
+                # Titolo
+                c.setFont("Helvetica-Bold", 18)
+                c.drawCentredString(A4[0]/2, A4[1] - 50, "VALUTAZIONE")
+                
+                # Linea separatrice
+                c.line(50, A4[1] - 70, A4[0] - 50, A4[1] - 70)
+                
+                # Punteggi
+                y = A4[1] - 100
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(50, y, "PUNTEGGI")
+                y -= 30
+                
+                c.setFont("Helvetica", 12)
+                total = 0
+                for i, s in enumerate(scores):
+                    c.drawString(70, y, f"Domanda {i+1}: {s:.1f}".replace('.', ','))
+                    total += s
+                    y -= 25
+                
+                # Totale
+                y -= 10
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(70, y, f"TOTALE: {total:.1f}".replace('.', ','))
+                y -= 40
+                
+                # Commenti
+                c.drawString(50, y, "COMMENTI:")
+                y -= 30
+                
+                c.setFont("Helvetica", 11)
+                comments = self.text_box.get("1.0", tk.END).strip()
+                
+                # Divide i commenti in linee più gestibili con textwrap
+                if comments:
+                    # Prima dividi in paragrafi (basati sui ritorni a capo esistenti)
+                    paragraphs = comments.split('\n')
+                    
+                    for paragraph in paragraphs:
+                        if not paragraph.strip():  # Se è una riga vuota
+                            y -= 15  # Spazio extra tra paragrafi
+                            continue
+                        
+                        # Usa textwrap per dividere ogni paragrafo in linee
+                        wrapped_lines = textwrap.wrap(paragraph, width=80)
+                        
+                        for line in wrapped_lines:
+                            if y < 50:  # Nuova pagina se necessario
+                                c.showPage()
+                                y = A4[1] - 50
+                                c.setFont("Helvetica", 11)
+                            
+                            c.drawString(70, y, line)
+                            y -= 20
+                        
+                        # Aggiungi uno spazio tra i paragrafi
+                        y -= 5
+                else:
+                    c.drawString(70, y, "Nessun commento")
+                    y -= 20
+                
+                c.showPage()
+                c.save()
+
+            # Aggiungi la pagina di valutazione alla fine
+            eval_reader = PdfReader(evalf.name)
+            for page in eval_reader.pages:
+                writer.add_page(page)
+
+            # Salva su file temporaneo e poi sostituisci
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                with open(tmp.name, "wb") as f:
+                    writer.write(f)
+            
+            # Sostituisci il file originale
+            os.replace(tmp.name, input_pdf)
+            
+            # Pulisci file temporanei
+            os.unlink(evalf.name)
+            
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Errore", f"Impossibile salvare il PDF: {str(e)}")
+            return False
+        
     def save_to_csv(self, scores):
         """Salva i punteggi in un file CSV con formato europeo (; come separatore, , come decimale)"""
         try:
