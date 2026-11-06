@@ -62,3 +62,10 @@ id,name,surname,email
 1,Mario,Rossi,mario.rossi@example.com
 2,Luisa,Bianchi,luisa.bianchi@example.com
 ```
+
+## Acknowledgments
+
+The grading tool was substantially improved with the help of Claude, made available through
+the **Claude Team plan for scientists** by Anthropic. Claude helped connect the grader to the
+Excel class list, fix several bugs in the original program, and add new features such as
+negative scores and reusable comment suggestions.
