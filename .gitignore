@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Credenziali e token (Gmail API / OAuth): non pubblicarli mai.
+# Il modello vuoto è credential.example.json
+credential*.json
+credentials*.json
+client_secret*.json
+token*.json
+*.pem
+*.key
+.env
+!credential.example.json
+
+# Dati degli studenti e file generati dal programma di correzione
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.pdf
+originali/
+.correzione_stato.json
+stato_lavoro.json
+valutazioni.csv

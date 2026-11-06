@@ -44,7 +44,9 @@ Each email is sent **individually**, with optional attachments, and supports sim
   - `[name]`
   - `[surname]`
   - `[email]`
-- Select a Gmail **credentials JSON file** (OAuth 2.0)
+- Select a Gmail **credentials JSON file** (OAuth 2.0). `credential.example.json` shows the
+  expected format; keep your real credentials outside the repository (`credential*.json`
+  and `token*.json` are git-ignored)
 - Attach one or more files that will be sent to **all recipients**
 - Simple graphical user interface (Tkinter)
 - Emails are sent one by one (not as a mailing list)
