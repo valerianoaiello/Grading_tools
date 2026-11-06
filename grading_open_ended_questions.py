@@ -1,16 +1,16 @@
 """
-Correzione delle domande aperte su compiti in PDF.
+Grading of open-ended questions in PDF exams.
 
-- Legge l'elenco studenti e le domande da un file Excel (foglio "Punteggi"):
-  riga 1 = intestazioni (Compito, Matricola, Cognome, Nome, ..., G1, G2, 7A, ...),
-  riga "massimo" = punteggio massimo di ogni domanda. Sono considerate domande
-  da correggere tutte le colonne che hanno un valore numerico nella riga "massimo".
-- Ogni PDF viene associato a uno studente tramite il numero del compito, preso
-  dall'ultimo gruppo di cifre nel nome del file (es. "compito_12.pdf" -> 12).
-- Permette di disegnare sulle pagine e di scrivere commenti; al salvataggio
-  scrive i punteggi nell'Excel e rigenera il PDF (originale + disegni + pagina
-  di valutazione). Gli originali vengono conservati nella sottocartella
-  "originali", quindi un compito può essere ricorretto senza duplicare nulla.
+- Reads the student list and the questions from an Excel file (sheet "Punteggi"):
+  row 1 = headers (Compito, Matricola, Cognome, Nome, ..., G1, G2, 7A, ...),
+  row "massimo" = maximum score of each question. Every column with a numeric
+  value in the "massimo" row is treated as a question to grade.
+- Each PDF is matched to a student through the exam number, taken from the
+  last group of digits in the file name (e.g. "compito_12.pdf" -> 12).
+- Lets you draw on the pages and write comments; on save it writes the scores
+  to the Excel file and regenerates the PDF (original + drawings + evaluation
+  page). Originals are kept in the "originali" subfolder, so an exam can be
+  regraded without duplicating anything.
 """
 import io
 import os
@@ -32,31 +32,31 @@ from pdf2image import convert_from_path
 from PIL import Image, ImageTk
 from openpyxl import load_workbook
 
-STATE_NAME = ".correzione_stato.json"   # nella cartella dei PDF
-BACKUP_DIR = "originali"                # sottocartella con i PDF originali
+STATE_NAME = ".correzione_stato.json"   # in the PDF folder
+BACKUP_DIR = "originali"                # subfolder holding the original PDFs
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".examinatrix_grader.json")
 RENDER_DPI = 200
 PEN_COLOR = "red"
 PEN_WIDTH_SCREEN = 3
-PEN_WIDTH_PDF = 1.5  # punti
-# Domande che ammettono punteggi negativi (fino a -massimo), se l'Excel non ha
-# una riga "minimo" che indica il minimo di ogni domanda
+PEN_WIDTH_PDF = 1.5  # points
+# Questions that accept negative scores (down to -maximum), unless the Excel
+# file has a "minimo" row giving the minimum of each question
 NEGATIVE_QUESTIONS = {"G1", "G2"}
 
 
 # ==================================================
-# Utilità
+# Utilities
 # ==================================================
 
 def compito_number(filename):
-    """Numero del compito: ultimo gruppo di cifre nel nome del file."""
+    """Exam number: last group of digits in the file name."""
     stem = os.path.splitext(os.path.basename(filename))[0]
     nums = re.findall(r"\d+", stem)
     return int(nums[-1]) if nums else None
 
 
 def fmt_num(x):
-    """Numero in formato italiano, senza decimali inutili."""
+    """Number in Italian format (decimal comma), without needless decimals."""
     if x is None:
         return ""
     x = float(x)
@@ -69,7 +69,7 @@ def parse_num(text):
 
 
 def _register_font():
-    """Font con supporto Unicode per la pagina di valutazione (fallback Helvetica)."""
+    """Unicode-capable font for the evaluation page (falls back to Helvetica)."""
     candidates = [
         ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", None),
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -112,7 +112,7 @@ def save_config(cfg):
 # ==================================================
 
 class ExcelGrades:
-    """Lettura/scrittura dei punteggi nel file Excel, per numero di compito."""
+    """Reads/writes scores in the Excel file, by exam number."""
 
     def __init__(self, path):
         self.path = path
@@ -135,7 +135,7 @@ class ExcelGrades:
         self.col_nome = lower.get("nome")
         self.col_note = lower.get("note")
 
-        # Riga dei massimi e righe degli studenti
+        # Row of maximums and student rows
         self.max_row = None
         self.min_row = None
         self.rows = {}
@@ -159,8 +159,8 @@ class ExcelGrades:
         if self.max_row is None:
             raise ValueError("Riga 'massimo' non trovata nella colonna 'Compito'.")
 
-        # Domande = colonne con un massimo numerico
-        self.questions = []  # lista di (nome, colonna, massimo)
+        # Questions = columns with a numeric maximum
+        self.questions = []  # list of (name, column, maximum)
         for c, h in sorted(headers.items()):
             if c == self.col_compito:
                 continue
@@ -170,8 +170,8 @@ class ExcelGrades:
         if not self.questions:
             raise ValueError("Nessuna domanda trovata (nessun valore numerico nella riga 'massimo').")
 
-        # Punteggio minimo: dalla riga "minimo" se esiste, altrimenti -massimo per le
-        # domande in NEGATIVE_QUESTIONS e 0 per le altre
+        # Minimum score: from the "minimo" row if present, otherwise -maximum for
+        # questions in NEGATIVE_QUESTIONS and 0 for the others
         self.minimums = {}
         for qname, c, qmax in self.questions:
             m = ws.cell(row=self.min_row, column=c).value if self.min_row else None
@@ -189,7 +189,7 @@ class ExcelGrades:
         return sum(q[2] for q in self.questions)
 
     def lock_file_exists(self):
-        """Excel crea '~$nomefile.xlsx' quando il file è aperto."""
+        """Excel creates '~$filename.xlsx' while the file is open."""
         d, name = os.path.split(self.path)
         return os.path.exists(os.path.join(d, "~$" + name))
 
@@ -239,8 +239,8 @@ class ExcelGrades:
 # ==================================================
 
 def _display_to_pdf(u, v, page):
-    """Coordinate normalizzate della pagina visualizzata (u verso destra, v verso il basso)
-    -> coordinate PDF della pagina, tenendo conto di cropbox e /Rotate."""
+    """Normalized coordinates on the displayed page (u to the right, v downwards)
+    -> PDF coordinates of the page, taking cropbox and /Rotate into account."""
     box = page.cropbox
     llx, lly = float(box.left), float(box.bottom)
     W, H = float(box.width), float(box.height)
@@ -257,7 +257,7 @@ def _display_to_pdf(u, v, page):
 
 
 def _overlay_page(page, strokes):
-    """Pagina PDF trasparente con i disegni (vettoriali)."""
+    """Transparent PDF page with the (vector) drawings."""
     box = page.mediabox
     buf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     buf.close()
@@ -349,7 +349,7 @@ def _evaluation_pages(student, questions, scores, comments, fonts):
 
 def build_graded_pdf(original, output, strokes_by_page, student, questions,
                      scores, comments, fonts):
-    """Crea il PDF corretto a partire dall'originale (che non viene modificato)."""
+    """Builds the graded PDF from the original (which is left untouched)."""
     reader = PdfReader(original)
     writer = PdfWriter()
     for i, page in enumerate(reader.pages, start=1):
@@ -367,7 +367,7 @@ def build_graded_pdf(original, output, strokes_by_page, student, questions,
 
 
 # ==================================================
-# Applicazione
+# Application
 # ==================================================
 
 class PDFAnnotatorApp:
@@ -382,15 +382,15 @@ class PDFAnnotatorApp:
 
         self.excel = None
         self.folder = ""
-        self.pdf_files = []      # lista di (numero_compito, percorso)
+        self.pdf_files = []      # list of (exam_number, path)
         self.current_index = 0
         self.current_page = 1
         self.total_pages = 1
         self.zoom = None
-        self.page_image = None   # pagina renderizzata (PIL, a RENDER_DPI)
+        self.page_image = None   # rendered page (PIL, at RENDER_DPI)
         self.disp_size = (1, 1)
         self.state = {"files": {}}
-        self.strokes = {}        # {"pagina": [[(u, v), ...], ...]} normalizzate 0..1
+        self.strokes = {}        # {"page": [[(u, v), ...], ...]} normalized 0..1
         self.current_stroke = None
         self.current_stroke_id = None
 
@@ -538,7 +538,7 @@ class PDFAnnotatorApp:
         self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
         self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
 
-        # ---- Valutazioni ----
+        # ---- Grading ----
         right = tk.Frame(main, width=420)
         right.pack(side=tk.RIGHT, fill="y", padx=(10, 0))
         right.pack_propagate(False)
@@ -598,7 +598,7 @@ class PDFAnnotatorApp:
         tk.Button(cbf, text="Copia commento precedente",
                   command=self.copy_previous_comment).pack(side=tk.LEFT, padx=2)
 
-        # Frasi già usate negli altri compiti (doppio clic per inserire)
+        # Phrases already used in other exams (double-click to insert)
         tk.Label(right, text="Frasi già usate (doppio clic per inserire):",
                  font=("Arial", 10, "bold")).pack(anchor="w", padx=5, pady=(5, 0))
         self.phrase_filter = tk.Entry(right, font=("Arial", 10))
@@ -617,7 +617,7 @@ class PDFAnnotatorApp:
         self.previous_comment = ""
 
     # --------------------------------------------------
-    # Stato (disegni e commenti, per file, nella cartella dei PDF)
+    # State (drawings and comments, per file, in the PDF folder)
     # --------------------------------------------------
 
     def state_path(self):
@@ -641,7 +641,7 @@ class PDFAnnotatorApp:
             print(f"Impossibile salvare lo stato: {e}")
 
     def remember_current(self):
-        """Memorizza disegni e commenti del compito corrente (non i punteggi)."""
+        """Stores drawings and comments of the current exam (not the scores)."""
         if not self.pdf_files:
             return
         name = os.path.basename(self.current_path())
@@ -651,7 +651,7 @@ class PDFAnnotatorApp:
         self.save_state()
 
     # --------------------------------------------------
-    # File correnti
+    # Current files
     # --------------------------------------------------
 
     def current_number(self):
@@ -664,7 +664,7 @@ class PDFAnnotatorApp:
         return os.path.join(os.path.dirname(path), BACKUP_DIR, os.path.basename(path))
 
     def source_path(self, path):
-        """Il PDF da mostrare/elaborare: l'originale se già salvato, altrimenti il file."""
+        """PDF to display/process: the original if already saved, otherwise the file itself."""
         orig = self.original_path(path)
         return orig if os.path.exists(orig) else path
 
@@ -714,7 +714,7 @@ class PDFAnnotatorApp:
             self.score_entries[0].focus_set()
 
     # --------------------------------------------------
-    # Visualizzazione
+    # Display
     # --------------------------------------------------
 
     def render_page(self):
@@ -790,7 +790,7 @@ class PDFAnnotatorApp:
         self.canvas.xview_scroll(step, "units")
 
     # --------------------------------------------------
-    # Disegno (coordinate salvate normalizzate 0..1: indipendenti dallo zoom)
+    # Drawing (coordinates stored normalized 0..1: independent of zoom)
     # --------------------------------------------------
 
     def _norm(self, e):
@@ -837,7 +837,7 @@ class PDFAnnotatorApp:
             self.show_page()
 
     # --------------------------------------------------
-    # Punteggi e commenti
+    # Scores and comments
     # --------------------------------------------------
 
     def calculate_total(self, event=None):
@@ -855,7 +855,7 @@ class PDFAnnotatorApp:
             self.score_entries[idx + 1].select_range(0, tk.END)
 
     def insert_comment(self, comment):
-        # Va a capo se il cursore non è a inizio riga
+        # Start a new line if the cursor is not at the beginning of a line
         if self.text_box.index(tk.INSERT).split(".")[1] != "0":
             comment = "\n" + comment
         self.text_box.insert(tk.INSERT, comment + "\n")
@@ -868,7 +868,7 @@ class PDFAnnotatorApp:
             messagebox.showinfo("Commento precedente", "Nessun commento nel compito precedente.")
 
     def refresh_phrases(self):
-        """Elenca le righe di commento usate negli altri compiti, le più frequenti in alto."""
+        """Lists the comment lines used in other exams, most frequent first."""
         current = os.path.basename(self.current_path()) if self.pdf_files else None
         counts = {}
         for name, entry in self.state["files"].items():
@@ -892,7 +892,7 @@ class PDFAnnotatorApp:
             self.text_box.focus_set()
 
     def read_scores(self):
-        """Punteggi validati, oppure None (dopo aver mostrato l'errore)."""
+        """Validated scores, or None (after showing the error)."""
         scores = []
         for e, (qname, _, qmax) in zip(self.score_entries, self.excel.questions):
             txt = e.get().strip()
@@ -917,11 +917,11 @@ class PDFAnnotatorApp:
         return scores
 
     # --------------------------------------------------
-    # Salvataggio
+    # Saving
     # --------------------------------------------------
 
     def save_current(self):
-        """Scrive i punteggi nell'Excel e rigenera il PDF. True se riuscito."""
+        """Writes the scores to Excel and regenerates the PDF. True on success."""
         scores = self.read_scores()
         if scores is None:
             return False
@@ -1009,7 +1009,7 @@ class PDFAnnotatorApp:
 
 
 # ==================================================
-# Avvio
+# Startup
 # ==================================================
 
 def _not_typing(root):
