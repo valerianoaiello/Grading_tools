@@ -39,6 +39,9 @@ RENDER_DPI = 200
 PEN_COLOR = "red"
 PEN_WIDTH_SCREEN = 3
 PEN_WIDTH_PDF = 1.5  # punti
+# Domande che ammettono punteggi negativi (fino a -massimo), se l'Excel non ha
+# una riga "minimo" che indica il minimo di ogni domanda
+NEGATIVE_QUESTIONS = {"G1", "G2"}
 
 
 # ==================================================
@@ -134,12 +137,16 @@ class ExcelGrades:
 
         # Riga dei massimi e righe degli studenti
         self.max_row = None
+        self.min_row = None
         self.rows = {}
         self.duplicates = []
         for r in range(2, ws.max_row + 1):
             v = ws.cell(row=r, column=self.col_compito).value
             if isinstance(v, str) and v.strip().lower() == "massimo":
                 self.max_row = r
+                continue
+            if isinstance(v, str) and v.strip().lower() == "minimo":
+                self.min_row = r
                 continue
             try:
                 n = int(v)
@@ -162,6 +169,18 @@ class ExcelGrades:
                 self.questions.append((h, c, float(m)))
         if not self.questions:
             raise ValueError("Nessuna domanda trovata (nessun valore numerico nella riga 'massimo').")
+
+        # Punteggio minimo: dalla riga "minimo" se esiste, altrimenti -massimo per le
+        # domande in NEGATIVE_QUESTIONS e 0 per le altre
+        self.minimums = {}
+        for qname, c, qmax in self.questions:
+            m = ws.cell(row=self.min_row, column=c).value if self.min_row else None
+            if isinstance(m, (int, float)) and not isinstance(m, bool):
+                self.minimums[qname] = float(m)
+            elif qname.upper() in NEGATIVE_QUESTIONS:
+                self.minimums[qname] = -qmax
+            else:
+                self.minimums[qname] = 0.0
 
         self.backup_path = None
 
@@ -400,7 +419,10 @@ class PDFAnnotatorApp:
             messagebox.showerror("Errore Excel", f"Impossibile leggere il file Excel:\n{e}")
             return False
 
-        qs = ", ".join(f"{q[0]} (max {fmt_num(q[2])})" for q in self.excel.questions)
+        qs = ", ".join(
+            f"{q[0]} (max {fmt_num(q[2])}"
+            + (f", min {fmt_num(self.excel.minimums[q[0]])})" if self.excel.minimums[q[0]] else ")")
+            for q in self.excel.questions)
         msg = f"Domande da correggere:\n{qs}\n\nStudenti trovati: {len(self.excel.rows)}"
         if self.excel.duplicates:
             msg += f"\n\nATTENZIONE: numeri di compito duplicati: {self.excel.duplicates}"
@@ -531,7 +553,9 @@ class PDFAnnotatorApp:
         for i, (qname, _, qmax) in enumerate(self.excel.questions):
             row = tk.Frame(sf)
             row.pack(fill="x", padx=10, pady=2)
-            tk.Label(row, text=f"{qname}  (max {fmt_num(qmax)}):", width=16,
+            qmin = self.excel.minimums[qname]
+            rng = f"max {fmt_num(qmax)}" if qmin == 0 else f"da {fmt_num(qmin)} a {fmt_num(qmax)}"
+            tk.Label(row, text=f"{qname}  ({rng}):", width=18,
                      anchor="w").pack(side=tk.LEFT)
             e = tk.Entry(row, width=8, font=("Arial", 11))
             e.pack(side=tk.LEFT)
@@ -540,7 +564,7 @@ class PDFAnnotatorApp:
             self.score_entries.append(e)
         trow = tk.Frame(sf)
         trow.pack(fill="x", padx=10, pady=(6, 4))
-        tk.Label(trow, text="Totale:", width=16, anchor="w",
+        tk.Label(trow, text="Totale:", width=18, anchor="w",
                  font=("Arial", 10, "bold")).pack(side=tk.LEFT)
         self.total_label = tk.Label(trow, text="0", font=("Arial", 11, "bold"), fg="green")
         self.total_label.pack(side=tk.LEFT)
@@ -882,9 +906,11 @@ class PDFAnnotatorApp:
                 messagebox.showwarning("Errore", f"Punteggio non valido per {qname}: '{txt}'")
                 e.focus_set()
                 return None
-            if s < 0 or s > qmax:
+            qmin = self.excel.minimums[qname]
+            if s < qmin or s > qmax:
                 messagebox.showwarning("Errore",
-                                       f"{qname}: il punteggio deve essere tra 0 e {fmt_num(qmax)}")
+                                       f"{qname}: il punteggio deve essere tra "
+                                       f"{fmt_num(qmin)} e {fmt_num(qmax)}")
                 e.focus_set()
                 return None
             scores.append(s)
