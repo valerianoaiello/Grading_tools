@@ -69,3 +69,7 @@ The grading tool was substantially improved with the help of Claude, made availa
 the **Claude Team plan for scientists** by Anthropic. Claude helped connect the grader to the
 Excel class list, fix several bugs in the original program, and add new features such as
 negative scores and reusable comment suggestions.
+
+## License
+
+Released under the [MIT License](LICENSE).
