@@ -6,12 +6,26 @@ This repository contains the first tool in a series of small Python utilities de
 A Python desktop application for grading PDF exams with annotations, scoring, and feedback.
 
 ### Features
-- Draw annotations directly on PDF pages
-- Score multiple questions per exam
-- Add comments that are appended as evaluation pages
-- Export scores to CSV (European format: `;` separator, `,` decimal)
-- Save progress automatically
-- Navigate with arrow controls
+- Reads students and questions from an Excel file (sheet `Punteggi`):
+  row 1 holds the headers (`Compito`, `Matricola`, `Cognome`, `Nome`, …), the row whose
+  `Compito` cell is `massimo` holds the maximum score of each question. Every column with a
+  numeric maximum is a question to grade (e.g. `G1`, `G2`, `7A`…`7D`).
+- Matches each PDF to a student by exam number: the last group of digits in the file name
+  (`compito_12.pdf`, `261103_12.pdf` and `12.pdf` all map to exam 12)
+- Writes each score into the right Excel cell and checks it does not exceed the maximum;
+  a timestamped backup of the Excel file is made at the first save of each session
+- Draw annotations on PDF pages (stored as vectors, independent of zoom)
+- Comments are appended to the PDF as an evaluation page with name, scores and total
+- Originals are kept in an `originali/` subfolder, so an exam can be regraded without
+  duplicating the evaluation page; drawings and comments are kept in `.correzione_stato.json`
+- Resumes from the first exam without scores; "Vai al compito…" jumps to any exam number
+
+### Requirements
+```bash
+pip install PyPDF2 pdf2image reportlab openpyxl pillow
+```
+`pdf2image` also needs Poppler (`brew install poppler` on macOS).
+Close the Excel file in Excel while grading: the program refuses to save while it is open.
 
 
 ## Email Sender 
