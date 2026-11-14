@@ -3,93 +3,140 @@ This repository contains the first tool in a series of small Python utilities de
 
 ## Grader for open ended questions
 
-A Python desktop application for grading PDF exams with annotations, scoring, and feedback.
+A Python desktop application for grading scanned PDF exams: draw on the pages, give
+scores and comments, and build for each student a PDF with the graded exam, an evaluation
+page and (optionally) the solutions and a true/false page.
+
+### Requirements
+- Python 3 with Tkinter, and the packages
+  ```bash
+  pip install PyPDF2 pdf2image reportlab openpyxl pillow
+  ```
+- **Poppler**, used by `pdf2image` to show the pages:
+  `brew install poppler` (macOS), `sudo apt install poppler-utils` (Debian/Ubuntu),
+  or the [Windows build](https://github.com/oschwartz10612/poppler-windows) added to `PATH`
+- **LaTeX** (`pdflatex`), only if your solutions are `.tex` files: MacTeX on macOS,
+  `texlive` on Linux, MiKTeX or TeX Live on Windows. Solutions given as PDF need nothing
+
+### Try it with the demo
+```bash
+python3 demo/make_demo.py
+python3 grading_open_ended_questions.py
+```
+Choose `demo/students.csv`, then the folder `demo/exams`, then `demo/solutions.zip`
+(one PDF per exam) or `demo/solutions.pdf` (the same for everybody). The demo has three
+made-up students, a rubric, example proposals and a true/false part.
+
+### Input files
+- **Exam PDFs**, one per student, all in one folder. The exam number is the last group of
+  digits in the file name: `exam_12.pdf`, `261103_12.pdf` and `12.pdf` all map to exam 12.
+- **Student list**, Excel (`.xlsx`) or CSV. Row 1 holds the column names, in English or
+  Italian (case does not matter):
+
+  | Field | Accepted names | |
+  |---|---|---|
+  | exam number | `Exam`, `Exam number`, `Compito`, `Numero compito` | required |
+  | student ID | `Student ID`, `ID`, `Matricola` | optional |
+  | surname | `Surname`, `Last name`, `Cognome` | optional |
+  | first name | `Name`, `First name`, `Nome` | optional |
+  | notes for you | `Notes`, `Note` | optional |
+
+  *Excel*: the sheet `Scores` (or `Punteggi`, otherwise the first sheet). A row whose exam
+  cell is `max` holds the maximum score of each question: every column with a numeric
+  maximum is a question to grade (e.g. `Q1`, `Q2`, `7A`…). An optional `min` row allows
+  negative scores (questions named `G1`, `G2` go down to −maximum by default; change
+  `NEGATIVE_QUESTIONS` in the code). Scores are written into the cells.
+
+  *CSV*: the questions are the exercises of the grading rubric; their columns and a total
+  column (`Open questions total`, or `Totale domande aperte` for an Italian file) are added.
+
+  A timestamped backup of the list is made at the first save of each session. Close the
+  file in Excel while grading: the program refuses to save while it is open.
+- **Solutions** (optional, button *Solutions…*): either a single PDF for everybody, or a zip
+  with one file per exam named after the exam number (`00012.pdf` or `00012.tex`; other
+  files of the zip, e.g. images, are available to LaTeX). The `.tex` files are compiled in
+  the background with `pdflatex`.
 
 ### Features
-- Reads students and questions from an Excel file (sheet `Punteggi`) or a CSV (see below):
-  row 1 holds the headers (`Compito`, `Matricola`, `Cognome`, `Nome`, …), the row whose
-  `Compito` cell is `massimo` holds the maximum score of each question. Every column with a
-  numeric maximum is a question to grade (e.g. `G1`, `G2`, `7A`…`7D`).
-- Matches each PDF to a student by exam number: the last group of digits in the file name
-  (`compito_12.pdf`, `261103_12.pdf` and `12.pdf` all map to exam 12)
-- Writes each score into the right Excel cell and checks it does not exceed the maximum;
-  a timestamped backup of the Excel file is made at the first save of each session
-- Draw annotations on PDF pages (stored as vectors, independent of zoom), with the mouse or a
-  pen tablet (Wacom…): pen tip draws, a tap leaves a dot, the side button (right click) erases
-  the strokes it touches; *Gomma* turns the pen tip into an eraser; *Annulla* (Cmd/Ctrl+Z)
-  undoes the last stroke, erase or page clear
-- **Solutions window** (*Soluzioni ⧉*): a second window showing the solutions of the exam being
-  graded, following the main window. The zip holds one `.tex` (or `.pdf`) per exam, named after
-  the exam number; the `.tex` files are compiled with `pdflatex` in the background into
-  `soluzioni_pdf/` in the PDF folder. The window position is remembered (e.g. on a second screen)
-- Comments are appended to the PDF as an evaluation page with name, scores and total
-- **Complete PDF for the student**, built on save:
-  1. *Pagina V/F* (CSV of Correggi VF only): a first page with the true/false part, i.e.
-     answers given, correct answers, outcome and points of each question, and the true/false
-     score. The columns are guessed from their names (`Compito`, `Risposta 1A`…, `Punti 1A`…,
-     `Totale`, `Risposte giuste`); *Colonne V/F…* shows them, with the first data row as an
-     example, and lets you change them (the choice is remembered for the folder). The maximum
-     of each question is the best score obtained in the class
-  2. the exam with your drawings, then the evaluation page
-  3. *Soluzioni in coda*: the solutions of that exam (from `soluzioni.zip`, see below)
+- Draw on the pages (stored as vectors, independent of zoom) with the mouse or a pen tablet
+  (Wacom…): the pen tip draws, a tap leaves a dot, the side button (right click) erases the
+  strokes it touches; *Eraser* turns the pen tip into an eraser; *Undo* (Cmd/Ctrl+Z) undoes
+  the last stroke, erase or page clear
+- Scores are checked against the maximum (and minimum) of each question; the program
+  resumes from the first exam without scores, and *Go to exam…* jumps to any exam
+- Comments, with buttons for frequent phrases and a list of the phrases already used in
+  other exams
+- **Solutions window** (*Solutions ⧉*): a second window with the solutions of the exam
+  being graded, following the main window; its position is remembered (e.g. on a second
+  screen)
+- **PDF for the student**, rebuilt at each save:
+  1. *T/F page* (CSV only): a first page with a true/false part, i.e. the answers given,
+     the correct answers, outcome and points of each question, and the score. The columns
+     are guessed from their names (`Answer 1A`… or `Risposta 1A`…, `Points 1A`… or
+     `Punti 1A`…, `Total`/`Totale`, `Correct answers`/`Risposte giuste`); *T/F columns…*
+     shows them with the first data row as an example and lets you change them. Answers
+     may be `T`/`F` or `V`/`F`; the correct answers are all in one column (e.g. `TFFT`).
+     The maximum of each question is the best score obtained in the class
+  2. the exam with your drawings, then the evaluation page with scores and comments
+  3. *Append solutions*: the solutions of that exam
+- **Language of the student pages**: Italian or English. *English* sets it for the current
+  exam, *English by default* for all the exams not opened yet
+- *Rebuild PDFs…* rebuilds the PDF of every graded exam with the current options (scores,
+  comments, drawings and language stay as saved)
+- **Grading rubric** (`rubric.txt` in the PDF folder, asked at startup if missing,
+  editable with *Rubric…*): for each exercise, the points given for each part of the answer
+- **Proposals** (`proposals.json` in the PDF folder, optional): proposed scores
+  (highlighted in yellow) and comments, e.g. written by Claude after reading the scans.
+  Check and edit them: nothing is written until you save
 
-  Both extra parts are in English for the exams marked *Inglese*. *Rigenera PDF…* rebuilds
-  the PDF of every exam already graded with the current options (scores, comments, drawings
-  and language stay as saved)
-- Originals are kept in an `originali/` subfolder, so an exam can be regraded without
-  duplicating the evaluation page; drawings and comments are kept in `.correzione_stato.json`
-- Resumes from the first exam without scores; "Vai al compito…" jumps to any exam number
-- Also reads the CSV written by *Correggi VF* (`risposte_totali.csv`, column `Numero compito`):
-  the open questions are then defined in the grading rubric, and their columns (plus
-  `Totale domande aperte`) are added to the CSV. A timestamped backup is made first
-- **Grading rubric** (`griglia.txt` in the PDF folder, asked at startup if missing, editable
-  with *Griglia…*): for each exercise, the points given for each part of the answer
-- **Proposals** (`proposte.json` in the PDF folder): proposed scores (highlighted in yellow)
-  and comment, written by Claude after reading the scans; check and edit them, nothing is
-  written to the Excel/CSV file until you save
-- **Inglese** switch: English comment proposal and English evaluation page, remembered per exam
+### Files written in the PDF folder
+| File | Content |
+|---|---|
+| `originals/` | the original scans: an exam can be regraded without duplicating pages |
+| `.grading_state.json` | drawings, comments, language and options of each exam |
+| `rubric.txt` | the grading rubric |
+| `solutions.zip` / `solutions.pdf` | a copy of the chosen solutions |
+| `solutions_pdf/` | the solutions compiled from the zip |
+
+Folders created by older versions, with the Italian names (`originali/`,
+`.correzione_stato.json`, `griglia.txt`, `proposte.json`, `soluzioni.zip`,
+`soluzioni_pdf/`), keep working.
 
 ### Grading rubric format
 ```
-[Esercizio 1]
-1     equazione caratteristica corretta
-0,5   soluzione generale
-1     problema di Cauchy risolto
--0,25 ogni errore di calcolo
+[Exercise 1]
+1     correct characteristic equation
+0.5   general solution
+1     initial value problem solved
+-0.25 each calculation error
 Note for the grader: any line that does not start with a number.
 
-[Esercizio 2]
+[Exercise 2]
 ...
 ```
-The name in brackets is the column name (for an Excel file it must match a column with a
-`massimo`). The maximum of an exercise is the sum of its positive points.
+The name in brackets is the name of the score column (for an Excel file it must match a
+column with a `max`). The maximum of an exercise is the sum of its positive points.
 
-### Proposals with Claude Code
-The scans are read by Claude in a Claude Code session (no API key needed). Give Claude the
-PDF folder (with `griglia.txt` and `soluzioni.zip`: the grader asks for the zip at startup
-and copies it there, or use *Soluzioni…*), and ask for the
-proposals. Claude writes `proposte.json`, which the grader re-reads whenever it changes:
+### Proposals format
 ```json
 {
   "12": {
-    "punteggi": {"Esercizio 1": 2, "Esercizio 2": 1.5},
-    "commento": "Esercizio 1: corretto. Esercizio 2: manca la verifica della condizione iniziale.",
+    "scores": {"Exercise 1": 2, "Exercise 2": 1.5},
+    "comment_it": "Esercizio 1: corretto. Esercizio 2: manca la verifica della condizione iniziale.",
     "comment_en": "Exercise 1: correct. Exercise 2: the initial condition is not checked.",
-    "dubbi": "Pagina 3 poco leggibile: controlla il segno nel passaggio finale."
+    "doubts": "Page 3 hard to read: check the sign in the last step."
   }
 }
 ```
-Keys are exam numbers. `dubbi` is shown only to you, never written in the PDF. Proposed
-scores outside the allowed range are ignored. Proposals are not used for exams already graded.
+Keys are exam numbers. `comment_it` and `comment_en` are used for Italian and English
+pages; a plain `comment` is used for both. `doubts` is shown only to you, never written in
+the PDF. Scores outside the allowed range are ignored, and proposals are not used for exams
+already graded. The Italian keys of older versions (`punteggi`, `commento`, `dubbi`) are
+also read.
 
-### Requirements
-```bash
-pip install PyPDF2 pdf2image reportlab openpyxl pillow
-```
-`pdf2image` also needs Poppler (`brew install poppler` on macOS).
-Close the Excel file in Excel while grading: the program refuses to save while it is open.
-
-
+**With Claude Code**: the scans can be read by Claude in a Claude Code session (no API key
+needed). Give Claude the PDF folder with the rubric and the solutions and ask for the
+proposals: Claude writes `proposals.json`, which the grader re-reads whenever it changes.
 
 ## Email Sender 
 

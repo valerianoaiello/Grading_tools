@@ -7,8 +7,8 @@ __pycache__/
 .venv/
 venv/
 
-# Credenziali e token (Gmail API / OAuth): non pubblicarli mai.
-# Il modello vuoto è credential.example.json
+# Credentials and tokens (Gmail API / OAuth): never publish them.
+# The empty template is credential.example.json
 credential*.json
 credentials*.json
 client_secret*.json
@@ -18,17 +18,23 @@ token*.json
 .env
 !credential.example.json
 
-# Dati degli studenti e file generati dal programma di correzione
+# Student data and files written by the grader (also the generated demo)
 *.xlsx
 *.xlsm
 *.xls
 *.csv
 *.pdf
+*.zip
+originals/
+solutions_pdf/
+.grading_state.json
+rubric.txt
+proposals.json
+# names used by older versions
 originali/
+soluzioni_pdf/
 .correzione_stato.json
 stato_lavoro.json
 valutazioni.csv
 proposte.json
 griglia.txt
-soluzioni.zip
-soluzioni_pdf/

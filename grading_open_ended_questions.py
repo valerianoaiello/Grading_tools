@@ -1,28 +1,31 @@
 """
 Grading of open-ended questions in PDF exams.
 
-- Reads the student list and the questions from an Excel file (sheet "Punteggi"):
-  row 1 = headers (Compito, Matricola, Cognome, Nome, ..., G1, G2, 7A, ...),
-  row "massimo" = maximum score of each question. Every column with a numeric
-  value in the "massimo" row is treated as a question to grade.
+- Reads the student list from an Excel file (sheet "Scores") or a CSV file. Column
+  names are recognised in English or Italian (Exam/Compito, Student ID/Matricola,
+  Surname/Cognome, Name/Nome, Notes/Note).
+  Excel: every column with a numeric value in the "max" row is a question to grade.
+  CSV: the questions come from the grading rubric and their columns are added.
 - Each PDF is matched to a student through the exam number, taken from the
-  last group of digits in the file name (e.g. "compito_12.pdf" -> 12).
-- Lets you draw on the pages and write comments; on save it writes the scores
-  to the Excel file and regenerates the PDF (original + drawings + evaluation
-  page). Originals are kept in the "originali" subfolder, so an exam can be
-  regraded without duplicating anything.
-- Also accepts the CSV written by "Correggi VF" (risposte_totali.csv, column
-  "Numero compito"): the questions then come from the grading rubric and their
-  columns are added to the CSV.
-- Grading rubric (griglia.txt in the PDF folder): for each exercise, the points
-  given for each part of the answer. Asked at startup if missing.
-- Proposals (proposte.json in the PDF folder, written by Claude in a Claude Code
-  session after reading the scans, the rubric and the LaTeX solutions): proposed
-  scores and comment (Italian and English) shown highlighted, to be checked and
-  edited before saving. Nothing is written until you save.
-- "Inglese" switch: comment proposal and evaluation page in English.
-- Drawing with mouse or pen tablet (side button / right click erases) and a second
-  window with the solutions of the current exam (LaTeX compiled with pdflatex).
+  last group of digits in the file name (e.g. "exam_12.pdf" -> 12).
+- Lets you draw on the pages (mouse or pen tablet) and write comments; on save it
+  writes the scores to the Excel/CSV file and rebuilds the PDF (original + drawings
+  + evaluation page). Originals are kept in the "originals" subfolder, so an exam can
+  be regraded without duplicating anything.
+- Grading rubric (rubric.txt in the PDF folder): for each exercise, the points
+  given for each part of the answer.
+- Proposals (proposals.json in the PDF folder, e.g. written by Claude in a Claude Code
+  session after reading the scans, the rubric and the solutions): proposed scores and
+  comment, shown highlighted, to be checked and edited before saving.
+- Solutions: a zip with one file per exam (.tex compiled with pdflatex, or .pdf) or a
+  single PDF for everybody. Shown in a second window and optionally appended to the
+  student's PDF.
+- True/false page (CSV only): a first page with the answers given, the correct answers
+  and the points of a true/false part.
+- Student-facing pages are in Italian or English (per exam, with a folder default).
+
+Folders created by older versions (griglia.txt, proposte.json, soluzioni.zip,
+originali/, .correzione_stato.json) keep working with their old file names.
 """
 import io
 import os
@@ -36,7 +39,7 @@ import time
 import subprocess
 import zipfile
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, scrolledtext
+from tkinter import filedialog, messagebox, simpledialog, scrolledtext, ttk
 from datetime import datetime
 
 from PyPDF2 import PdfReader, PdfWriter
@@ -49,8 +52,6 @@ from pdf2image import convert_from_path
 from PIL import Image, ImageTk
 from openpyxl import load_workbook
 
-STATE_NAME = ".correzione_stato.json"   # in the PDF folder
-BACKUP_DIR = "originali"                # subfolder holding the original PDFs
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".examinatrix_grader.json")
 RENDER_DPI = 200
 PEN_COLOR = "red"
@@ -58,17 +59,39 @@ PEN_WIDTH_SCREEN = 3
 PEN_WIDTH_PDF = 1.5  # points
 ERASER_RADIUS = 10   # screen pixels: strokes closer than this to the eraser are removed
 # Questions that accept negative scores (down to -maximum), unless the Excel
-# file has a "minimo" row giving the minimum of each question
+# file has a "min" row giving the minimum of each question
 NEGATIVE_QUESTIONS = {"G1", "G2"}
-RUBRIC_NAME = "griglia.txt"             # grading rubric, in the PDF folder
-PROPOSALS_NAME = "proposte.json"        # Claude's proposals, in the PDF folder
-SOLUTIONS_NAME = "soluzioni.zip"        # LaTeX solutions, copied into the PDF folder
-CSV_TOTAL_COLUMN = "Totale domande aperte"
 PROPOSAL_BG = "#fff3b0"                 # background of proposed (unchecked) scores
-SOLUTIONS_PDF_DIR = "soluzioni_pdf"     # compiled solutions, in the PDF folder
 SOLUTIONS_DPI = 150
 
-# Texts of the evaluation page and of the quick comment buttons
+# Files kept in the PDF folder: (name, name used by older versions or None).
+# The old name is used when only the old file exists.
+FOLDER_FILES = {
+    "state": (".grading_state.json", ".correzione_stato.json"),
+    "originals": ("originals", "originali"),
+    "rubric": ("rubric.txt", "griglia.txt"),
+    "proposals": ("proposals.json", "proposte.json"),
+    "solutions_zip": ("solutions.zip", "soluzioni.zip"),
+    "solutions_pdf": ("solutions.pdf", None),
+    "compiled": ("solutions_pdf", "soluzioni_pdf"),   # solutions compiled from the zip
+}
+
+# Column names accepted in the Excel/CSV file (compared lower case)
+COLUMN_NAMES = {
+    "exam": ("exam", "exam number", "exam no", "compito", "numero compito"),
+    "student_id": ("student id", "id", "matricola"),
+    "surname": ("surname", "last name", "family name", "cognome"),
+    "name": ("name", "first name", "given name", "nome"),
+    "notes": ("notes", "note"),
+}
+ITALIAN_EXAM_COLUMNS = {"compito", "numero compito"}
+SHEET_NAMES = ("Scores", "Punteggi")
+MAX_ROW_LABELS = ("max", "maximum", "massimo")
+MIN_ROW_LABELS = ("min", "minimum", "minimo")
+# Column with the total of the open questions, added to a CSV file
+CSV_TOTAL_COLUMN = {False: "Open questions total", True: "Totale domande aperte"}  # key: Italian file
+
+# Texts of the evaluation page and of the quick comment buttons (key: English)
 LABELS = {
     False: {"title": "VALUTAZIONE", "exam": "Compito", "id": "Matricola",
             "scores": "PUNTEGGI", "total": "Totale domande aperte",
@@ -81,38 +104,61 @@ LABELS = {
 }
 
 RUBRIC_HELP = (
-    "Una sezione per esercizio: [nome] su una riga (il nome è quello della colonna).\n"
-    "Sotto, una riga per criterio: punti e descrizione, es.  1  equazione caratteristica corretta\n"
-    "Punti negativi = penalità (es.  -0,25  errore di calcolo). Il massimo dell'esercizio\n"
-    "è la somma dei punti positivi. Le altre righe sono note per chi corregge; # = commento.")
+    "One section per exercise: [name] on its own line (the name of the score column).\n"
+    "Below it, one line per criterion: points and description, e.g.  1  correct characteristic equation\n"
+    "Negative points = penalties (e.g.  -0.25  calculation error). The maximum of the exercise\n"
+    "is the sum of its positive points. Other lines are notes for the grader; # = comment.")
 
 
 # ==================================================
 # Utilities
 # ==================================================
 
-def compito_number(filename):
+def exam_number(filename):
     """Exam number: last group of digits in the file name."""
     stem = os.path.splitext(os.path.basename(filename))[0]
     nums = re.findall(r"\d+", stem)
     return int(nums[-1]) if nums else None
 
 
-def fmt_num(x):
-    """Number in Italian format (decimal comma), without needless decimals."""
+def fmt_num(x, comma=False):
+    """Number without needless decimals; decimal comma if requested (Italian pages)."""
     if x is None:
         return ""
     x = float(x)
     s = f"{x:.0f}" if x == int(x) else f"{x:.2f}".rstrip("0")
-    return s.replace(".", ",")
+    return s.replace(".", ",") if comma else s
 
 
 def parse_num(text):
-    return float(text.strip().replace(",", "."))
+    """Number typed with a decimal point or comma."""
+    return float(str(text).strip().replace(",", "."))
+
+
+def to_float(x):
+    try:
+        return parse_num(x)
+    except ValueError:
+        return None
+
+
+def folder_path(folder, key):
+    """Path of one of the program's files in the PDF folder (see FOLDER_FILES)."""
+    new, old = FOLDER_FILES[key]
+    if old and not os.path.exists(os.path.join(folder, new)) \
+            and os.path.exists(os.path.join(folder, old)):
+        return os.path.join(folder, old)
+    return os.path.join(folder, new)
+
+
+def find_column(lower, key):
+    """Index of the column for a field (see COLUMN_NAMES), or None.
+    lower: {lower-case header: index}."""
+    return next((lower[a] for a in COLUMN_NAMES[key] if a in lower), None)
 
 
 def _register_font():
-    """Unicode-capable font for the evaluation page (falls back to Helvetica)."""
+    """Unicode-capable font for the generated pages (falls back to Helvetica)."""
     candidates = [
         ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", None),
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -173,13 +219,13 @@ def parse_rubric(text):
             end = line.find("]")
             name = line[1:end].strip() if end > 0 else ""
             if not name:
-                raise ValueError(f"Riga {lineno}: nome dell'esercizio mancante: {raw!r}")
+                raise ValueError(f"Line {lineno}: missing exercise name: {raw!r}")
             if any(e["name"] == name for e in exercises):
-                raise ValueError(f"Riga {lineno}: esercizio {name} ripetuto")
+                raise ValueError(f"Line {lineno}: exercise {name} appears twice")
             exercises.append({"name": name, "criteria": [], "notes": []})
             continue
         if not exercises:
-            raise ValueError(f"Riga {lineno}: manca prima [nome dell'esercizio]")
+            raise ValueError(f"Line {lineno}: write an [exercise name] first")
         m = _CRITERION.match(line)
         if m:
             exercises[-1]["criteria"].append((parse_num(m.group(1)), m.group(2).strip()))
@@ -192,15 +238,15 @@ def parse_rubric(text):
 
 def rubric_template(questions):
     """Empty rubric with one section per question (name, maximum)."""
-    lines = ["# Griglia di valutazione", ""]
+    lines = ["# Grading rubric", ""]
     for name, qmax in questions:
-        lines.append(f"[{name}]" + (f"   # massimo {fmt_num(qmax)}" if qmax else ""))
+        lines.append(f"[{name}]" + (f"   # maximum {fmt_num(qmax)}" if qmax else ""))
         lines.append("")
     return "\n".join(lines)
 
 
 # ==================================================
-# Excel
+# Score files (Excel or CSV)
 # ==================================================
 
 class ExcelGrades:
@@ -211,7 +257,8 @@ class ExcelGrades:
     def __init__(self, path):
         self.path = path
         self.wb = load_workbook(path)
-        self.ws = self.wb["Punteggi"] if "Punteggi" in self.wb.sheetnames else self.wb.active
+        sheet = next((s for s in SHEET_NAMES if s in self.wb.sheetnames), None)
+        self.ws = self.wb[sheet] if sheet else self.wb.active
         ws = self.ws
 
         headers = {}
@@ -221,13 +268,13 @@ class ExcelGrades:
                 headers[c] = str(v).strip()
         lower = {h.lower(): c for c, h in headers.items()}
 
-        if "compito" not in lower:
-            raise ValueError("Colonna 'Compito' non trovata nella riga 1 del foglio.")
-        self.col_compito = lower["compito"]
-        self.col_matricola = lower.get("matricola")
-        self.col_cognome = lower.get("cognome")
-        self.col_nome = lower.get("nome")
-        self.col_note = lower.get("note")
+        self.col_exam = find_column(lower, "exam")
+        if self.col_exam is None:
+            raise ValueError("No 'Exam' (or 'Compito') column in row 1 of the sheet.")
+        self.col_student_id = find_column(lower, "student_id")
+        self.col_surname = find_column(lower, "surname")
+        self.col_name = find_column(lower, "name")
+        self.col_notes = find_column(lower, "notes")
 
         # Row of maximums and student rows
         self.max_row = None
@@ -235,11 +282,12 @@ class ExcelGrades:
         self.rows = {}
         self.duplicates = []
         for r in range(2, ws.max_row + 1):
-            v = ws.cell(row=r, column=self.col_compito).value
-            if isinstance(v, str) and v.strip().lower() == "massimo":
+            v = ws.cell(row=r, column=self.col_exam).value
+            label = v.strip().lower() if isinstance(v, str) else None
+            if label in MAX_ROW_LABELS:
                 self.max_row = r
                 continue
-            if isinstance(v, str) and v.strip().lower() == "minimo":
+            if label in MIN_ROW_LABELS:
                 self.min_row = r
                 continue
             try:
@@ -251,25 +299,25 @@ class ExcelGrades:
             else:
                 self.rows[n] = r
         if self.max_row is None:
-            raise ValueError("Riga 'massimo' non trovata nella colonna 'Compito'.")
+            raise ValueError("No 'max' (or 'massimo') row in the exam column.")
 
         # Questions = columns with a numeric maximum
         self.questions = []  # list of (name, column, maximum)
         for c, h in sorted(headers.items()):
-            if c == self.col_compito:
+            if c == self.col_exam:
                 continue
             m = ws.cell(row=self.max_row, column=c).value
-            if isinstance(m, (int, float)) and not isinstance(m, bool):
+            if _is_number(m):
                 self.questions.append((h, c, float(m)))
         if not self.questions:
-            raise ValueError("Nessuna domanda trovata (nessun valore numerico nella riga 'massimo').")
+            raise ValueError("No questions found (no numeric value in the 'max' row).")
 
-        # Minimum score: from the "minimo" row if present, otherwise -maximum for
+        # Minimum score: from the "min" row if present, otherwise -maximum for
         # questions in NEGATIVE_QUESTIONS and 0 for the others
         self.minimums = {}
         for qname, c, qmax in self.questions:
             m = ws.cell(row=self.min_row, column=c).value if self.min_row else None
-            if isinstance(m, (int, float)) and not isinstance(m, bool):
+            if _is_number(m):
                 self.minimums[qname] = float(m)
             elif qname.upper() in NEGATIVE_QUESTIONS:
                 self.minimums[qname] = -qmax
@@ -298,16 +346,16 @@ class ExcelGrades:
             v = self.ws.cell(row=r, column=col).value
             return "" if v is None else str(v)
 
-        return {"compito": n, "matricola": val(self.col_matricola),
-                "cognome": val(self.col_cognome), "nome": val(self.col_nome),
-                "note": val(self.col_note)}
+        return {"exam": n, "student_id": val(self.col_student_id),
+                "surname": val(self.col_surname), "name": val(self.col_name),
+                "notes": val(self.col_notes)}
 
     def get_scores(self, n):
         r = self.rows[n]
         out = []
         for _, c, _ in self.questions:
             v = self.ws.cell(row=r, column=c).value
-            out.append(v if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+            out.append(v if _is_number(v) else None)
         return out
 
     def is_graded(self, n):
@@ -329,9 +377,9 @@ class ExcelGrades:
 
 
 class CsvGrades:
-    """Reads/writes scores in the CSV of "Correggi VF" (or any CSV with a
-    "Numero compito"/"Compito" column). The questions are not in the file: they
-    come from the rubric (set_questions), and their columns are added if missing."""
+    """Reads/writes scores in a CSV file with an exam number column (e.g. the CSV of
+    "Correggi VF"). The questions are not in the file: they come from the rubric
+    (set_questions), and their columns are added if missing."""
     kind = "CSV"
     questions_from_rubric = True
 
@@ -345,24 +393,27 @@ class CsvGrades:
             self.dialect = csv.excel
         self.data = [r for r in csv.reader(io.StringIO(text), self.dialect)]
         if not self.data:
-            raise ValueError("Il file CSV è vuoto.")
+            raise ValueError("The CSV file is empty.")
         self.header = [h.strip() for h in self.data[0]]
         lower = {h.lower(): i for i, h in enumerate(self.header) if h}
 
-        col = lower.get("numero compito", lower.get("compito"))
-        if col is None:
-            raise ValueError("Colonna 'Numero compito' (o 'Compito') non trovata nella prima riga.")
-        self.col_compito = col
-        self.col_matricola = lower.get("matricola")
-        self.col_cognome = lower.get("cognome")
-        self.col_nome = lower.get("nome")
-        self.col_note = lower.get("note")
+        self.col_exam = find_column(lower, "exam")
+        if self.col_exam is None:
+            raise ValueError("No 'Exam' (or 'Numero compito') column in the first row.")
+        italian = self.header[self.col_exam].lower() in ITALIAN_EXAM_COLUMNS
+        # Total of the open questions: an existing column, or one in the file's language
+        self.total_column = next((t for t in CSV_TOTAL_COLUMN.values() if t in self.header),
+                                 CSV_TOTAL_COLUMN[italian])
+        self.col_student_id = find_column(lower, "student_id")
+        self.col_surname = find_column(lower, "surname")
+        self.col_name = find_column(lower, "name")
+        self.col_notes = find_column(lower, "notes")
 
         self.rows = {}
         self.duplicates = []
         for i, row in enumerate(self.data[1:], start=1):
             try:
-                n = int(str(row[col]).strip())
+                n = int(str(row[self.col_exam]).strip())
             except (IndexError, ValueError):
                 continue
             if n in self.rows:
@@ -400,19 +451,13 @@ class CsvGrades:
         r = self.rows.get(n)
         if r is None:
             return None
-        return {"compito": n, "matricola": self._cell(r, self.col_matricola),
-                "cognome": self._cell(r, self.col_cognome), "nome": self._cell(r, self.col_nome),
-                "note": self._cell(r, self.col_note)}
+        return {"exam": n, "student_id": self._cell(r, self.col_student_id),
+                "surname": self._cell(r, self.col_surname), "name": self._cell(r, self.col_name),
+                "notes": self._cell(r, self.col_notes)}
 
     def get_scores(self, n):
         r = self.rows[n]
-        out = []
-        for _, c, _ in self.questions:
-            try:
-                out.append(parse_num(self._cell(r, c)))
-            except ValueError:
-                out.append(None)
-        return out
+        return [to_float(self._cell(r, c)) for _, c, _ in self.questions]
 
     def is_graded(self, n):
         return bool(self.questions) and all(v is not None for v in self.get_scores(n))
@@ -420,7 +465,7 @@ class CsvGrades:
     def set_scores(self, n, scores):
         row = self.data[self.rows[n]]
         values = [(c, f"{s:g}") for (_, c, _), s in zip(self.questions, scores)]
-        values.append((self._column(CSV_TOTAL_COLUMN), f"{sum(scores):g}"))
+        values.append((self._column(self.total_column), f"{sum(scores):g}"))
         for c, v in values:
             row.extend([""] * (c + 1 - len(row)))
             row[c] = v
@@ -492,6 +537,7 @@ def _overlay_page(page, strokes):
 def _evaluation_pages(student, questions, scores, comments, fonts, english=False):
     regular, bold = fonts
     T = LABELS[bool(english)]
+    num = lambda x: fmt_num(x, comma=not english)
     buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=A4)
     W, H = A4
@@ -503,12 +549,12 @@ def _evaluation_pages(student, questions, scores, comments, fonts, english=False
 
     y = H - 85
     c.setFont(regular, 11)
-    who = f"{T['exam']} {student['compito']}"
-    name = f"{student.get('cognome', '')} {student.get('nome', '')}".strip()
+    who = f"{T['exam']} {student['exam']}"
+    name = f"{student.get('surname', '')} {student.get('name', '')}".strip()
     if name:
         who += f" - {name}"
-    if student.get("matricola"):
-        who += f" - {T['id']} {student['matricola']}"
+    if student.get("student_id"):
+        who += f" - {T['id']} {student['student_id']}"
     c.drawString(left, y, who)
     y -= 35
 
@@ -518,13 +564,12 @@ def _evaluation_pages(student, questions, scores, comments, fonts, english=False
     c.setFont(regular, 12)
     total = 0.0
     for (qname, _, qmax), s in zip(questions, scores):
-        c.drawString(70, y, f"{qname}: {fmt_num(s)} / {fmt_num(qmax)}")
+        c.drawString(70, y, f"{qname}: {num(s)} / {num(qmax)}")
         total += s
         y -= 22
     y -= 8
     c.setFont(bold, 13)
-    c.drawString(70, y, f"{T['total']}: {fmt_num(total)} / "
-                        f"{fmt_num(sum(q[2] for q in questions))}")
+    c.drawString(70, y, f"{T['total']}: {num(total)} / {num(sum(q[2] for q in questions))}")
     y -= 40
 
     c.setFont(bold, 14)
@@ -580,101 +625,121 @@ def build_graded_pdf(original, output, strokes_by_page, student, questions,
 
 
 # ==================================================
-# True/false page (from the CSV of "Correggi VF")
+# True/false page (from a CSV with one answer column per question)
 # ==================================================
 
-VF_TEXT = {
+TF_TEXT = {
     False: {"title": "Domande vero/falso", "exam": "Compito n.", "student": "Studente",
             "id": "Matricola", "question": "Domanda", "given": "Risposta data",
             "correct": "Risposta corretta", "outcome": "Esito", "points": "Punti",
             "total": "Punteggio vero/falso", "right": "giusta", "wrong": "sbagliata",
-            "blank": "non data", "answer": {"V": "Vero", "F": "Falso"}},
+            "blank": "non data", "special": "DSA", "answer": {"T": "Vero", "F": "Falso"}},
     True: {"title": "True/false questions", "exam": "Exam no.", "student": "Student",
            "id": "Student ID", "question": "Question", "given": "Your answer",
            "correct": "Correct answer", "outcome": "Outcome", "points": "Points",
            "total": "True/false score", "right": "correct", "wrong": "wrong",
-           "blank": "not given", "answer": {"V": "True", "F": "False"}},
+           "blank": "not given", "special": "Special arrangements",
+           "answer": {"T": "True", "F": "False"}},
 }
 GREEN, RED, GREY = (0.0, 0.5, 0.15), (0.8, 0.1, 0.1), (0.45, 0.45, 0.45)
 
+# Fields of the column mapping: (key, label shown in the window, required)
+TF_FIELDS = [("exam", "Exam number", True), ("surname", "Surname", True),
+             ("name", "First name", True), ("student_id", "Student ID", False),
+             ("special", "Special arrangements (e.g. DSA)", False),
+             ("total", "True/false score (total)", True),
+             ("key", "Correct answers (all in one column)", True)]
+TF_COLUMN_NAMES = {
+    **{k: COLUMN_NAMES[k] for k in ("exam", "surname", "name", "student_id")},
+    "special": ("special arrangements", "dsa"),
+    "total": ("total", "totale", "true/false total"),
+    "key": ("correct answers", "answer key", "key", "risposte giuste"),
+}
+ANSWER_PREFIXES = ("answer ", "risposta ")    # e.g. "Answer 1A", "Risposta 1A"
+POINTS_PREFIXES = ("points ", "punti ")       # e.g. "Points 1A", "Punti 1A"
+# Keys of the mapping saved by older versions
+_OLD_TF_KEYS = {"num": "exam", "cognome": "surname", "nome": "name",
+                "matricola": "student_id", "dsa": "special"}
 
 
-def to_float(x):
-    try:
-        return float(str(x).strip().replace(",", "."))
-    except ValueError:
-        return None
+def tf_value(x):
+    """'T' (true), 'F' (false) or '' for an answer written as T/F, V/F, True/Vero..."""
+    x = str(x).strip().upper()
+    if x in ("T", "V", "TRUE", "VERO"):
+        return "T"
+    if x in ("F", "FALSE", "FALSO"):
+        return "F"
+    return ""
 
 
-def _fmt_text(x):
-    """A number read from the CSV, in Italian format (unchanged if not a number)."""
+def _fmt_text(x, comma):
+    """A number read from the CSV, formatted (unchanged if not a number)."""
     v = to_float(x)
-    return fmt_num(v) if v is not None else str(x)
+    return fmt_num(v, comma) if v is not None else str(x)
 
 
-# Fields of the mapping: (key, label shown in the window, required)
-VF_FIELDS = [("num", "Numero del compito", True), ("cognome", "Cognome", True),
-          ("nome", "Nome", True), ("matricola", "Matricola", False), ("dsa", "DSA", False),
-          ("total", "Punteggio vero/falso (totale)", True),
-          ("key", "Risposte giuste (tutte in una colonna)", True)]
+def _strip_prefix(header, prefixes):
+    """Rest of the header after one of the prefixes, or None."""
+    h = header.lower()
+    return next((header[len(p):].strip() for p in prefixes if h.startswith(p)), None)
 
 
-def guess_vf_columns(header):
+def guess_tf_columns(header):
     """Guess of the columns, by name: {field: index or None, "answers": [...], "points": [...]}"""
     low = [h.lower() for h in header]
-
-    def col(*names):
-        return next((low.index(n.lower()) for n in names if n.lower() in low), None)
-
-    m = {"num": col("Numero compito", "Compito"), "cognome": col("Cognome"),
-         "nome": col("Nome"), "matricola": col("Matricola"), "dsa": col("DSA"),
-         "total": col("Totale"), "key": col("Risposte giuste")}
-    m["answers"] = [i for i, h in enumerate(low)
-                    if h.startswith("risposta ") and h != "risposte giuste"]
-    points = {h[len("punti "):].strip(): i for i, h in enumerate(low) if h.startswith("punti ")}
-    m["points"] = [points[low[i][len("risposta "):].strip()] for i in m["answers"]
-                   if low[i][len("risposta "):].strip() in points]
+    lower = {h: i for i, h in reversed(list(enumerate(low))) if h}
+    m = {key: next((lower[a] for a in names if a in lower), None)
+         for key, names in TF_COLUMN_NAMES.items()}
+    key_names = set(TF_COLUMN_NAMES["key"])
+    m["answers"] = [i for i, h in enumerate(header)
+                    if _strip_prefix(h, ANSWER_PREFIXES) and low[i] not in key_names]
+    points = {_strip_prefix(h, POINTS_PREFIXES): i for i, h in enumerate(header)
+              if _strip_prefix(h, POINTS_PREFIXES)}
+    m["points"] = [points[q] for q in (_strip_prefix(header[i], ANSWER_PREFIXES)
+                                       for i in m["answers"]) if q in points]
     if len(m["points"]) != len(m["answers"]):
         m["points"] = []
     return m
 
 
-def check_vf_columns(m):
+def check_tf_columns(m):
     """Error message for an incomplete mapping, or None."""
-    for key, label, required in VF_FIELDS:
+    for key, label, required in TF_FIELDS:
         if required and m.get(key) is None:
-            return f"Scegli la colonna «{label}»."
+            return f"Choose the «{label}» column."
     if not m.get("answers"):
-        return "Scegli le colonne con le risposte date dallo studente."
+        return "Choose the columns with the student's answers."
     if m.get("points") and len(m["points"]) != len(m["answers"]):
-        return (f"Hai scelto {len(m['answers'])} colonne di risposte e {len(m['points'])} "
-                "di punti: devono essere tante quante (o nessuna colonna di punti).")
+        return (f"You chose {len(m['answers'])} answer columns and {len(m['points'])} "
+                "points columns: they must be as many (or no points column at all).")
     return None
 
 
-def vf_question_label(name):
-    return name[len("Risposta "):].strip() if name.lower().startswith("risposta ") else name
+def tf_question_label(name):
+    return _strip_prefix(name, ANSWER_PREFIXES) or name
 
 
-def vf_students(header, rows, m):
+def tf_students(header, rows, m):
     """Returns (students {n: dict}, questions [label], max_points [float|None])."""
-    err = check_vf_columns(m)
+    err = check_tf_columns(m)
     if err:
         raise ValueError(err)
-    questions = [vf_question_label(header[i]) for i in m["answers"]]
+    questions = [tf_question_label(header[i]) for i in m["answers"]]
     students = {}
     for r in rows:
         r = r + [""] * (len(header) - len(r))
         try:
-            n = int(float(r[m["num"]]))
+            n = int(float(r[m["exam"]]))
         except ValueError:
-            continue                      # e.g. a "massimo" row
+            continue                      # e.g. a "max" row
         get = lambda k: r[m[k]].strip() if m.get(k) is not None else ""
+        special = get("special")
         students[n] = {
-            "cognome": get("cognome"), "nome": get("nome"), "matricola": get("matricola"),
-            "dsa": bool(get("dsa")) and get("dsa").lower() not in ("no", "0", "false"),
-            "total": get("total"), "key": get("key").upper().replace(" ", ""),
-            "given": [r[i].strip().upper() for i in m["answers"]],
+            "surname": get("surname"), "name": get("name"), "student_id": get("student_id"),
+            "special": bool(special) and special.lower() not in ("no", "0", "false"),
+            "total": get("total"),
+            "key": [tf_value(ch) for ch in re.sub(r"[\s,;]", "", get("key"))],
+            "given": [tf_value(r[i]) for i in m["answers"]],
             "points": [r[i].strip() for i in m["points"]] or [""] * len(questions),
         }
     # Maximum of each question: the best score obtained by someone (unknown if nobody got it)
@@ -689,7 +754,8 @@ def vf_students(header, rows, m):
 def true_false_page(n, st, questions, max_points, fonts, english=False):
     """First page with the true/false part: answers given, correct answers, points."""
     regular, bold = fonts
-    T = VF_TEXT[bool(english)]
+    T = TF_TEXT[bool(english)]
+    comma = not english
     W, H = size = A4
     buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=size)
@@ -700,13 +766,13 @@ def true_false_page(n, st, questions, max_points, fonts, english=False):
     c.setFont(regular, 12)
     c.drawRightString(right, y, f"{T['exam']} {n:05d}")
     y -= 28
-    c.drawString(left, y, f"{T['student']}: {st['cognome']} {st['nome']}".rstrip())
-    if st["matricola"]:
-        c.drawRightString(right, y, f"{T['id']}: {st['matricola']}")
-    if st["dsa"]:
+    c.drawString(left, y, f"{T['student']}: {st['surname']} {st['name']}".rstrip())
+    if st["student_id"]:
+        c.drawRightString(right, y, f"{T['id']}: {st['student_id']}")
+    if st["special"]:
         y -= 18
         c.setFont(regular, 11)
-        c.drawString(left, y, "DSA")
+        c.drawString(left, y, T["special"])
     y -= 36
 
     cols = [left, left + 85, left + 200, left + 330, right]   # question, given, correct, outcome, points
@@ -723,7 +789,7 @@ def true_false_page(n, st, questions, max_points, fonts, english=False):
     for k, q in enumerate(questions):
         given = st["given"][k] if k < len(st["given"]) else ""
         key = st["key"][k] if k < len(st["key"]) else ""
-        if given not in ("V", "F"):
+        if not given:
             outcome, colour = T["blank"], GREY
         elif given == key:
             outcome, colour = T["right"], GREEN
@@ -740,7 +806,8 @@ def true_false_page(n, st, questions, max_points, fonts, english=False):
         c.setFillColorRGB(0, 0, 0)
         pts = st["points"][k] if k < len(st["points"]) else ""
         mx = max_points[k]
-        c.drawRightString(cols[4], y, _fmt_text(pts) + (f" / {fmt_num(mx)}" if mx and pts != "" else ""))
+        c.drawRightString(cols[4], y, _fmt_text(pts, comma)
+                          + (f" / {fmt_num(mx, comma)}" if mx and pts != "" else ""))
         y -= 22
         if k + 1 < len(questions) and questions[k + 1][:1] != q[:1]:   # new exercise
             c.setStrokeColorRGB(0.8, 0.8, 0.8)
@@ -753,39 +820,36 @@ def true_false_page(n, st, questions, max_points, fonts, english=False):
     c.line(left, y + 12, right, y + 12)
     y -= 14
     c.setFont(bold, 14)
-    # DSA students answer fewer questions: no overall maximum for them
-    total_max = sum(max_points) if all(max_points) and not st["dsa"] else None
+    # Students with special arrangements may answer fewer questions: no overall maximum
+    total_max = sum(max_points) if all(max_points) and not st["special"] else None
     c.drawString(left, y, T["total"])
-    c.drawRightString(right, y, _fmt_text(st["total"]) + (f" / {fmt_num(total_max)}" if total_max else ""))
+    c.drawRightString(right, y, _fmt_text(st["total"], comma)
+                      + (f" / {fmt_num(total_max, comma)}" if total_max else ""))
     c.showPage()
     c.save()
     buf.seek(0)
     return PdfReader(buf).pages[0]
 
 
-
-def choose_vf_columns(root, header, rows, guess):
+def choose_tf_columns(root, header, rows, guess):
     """Window to choose the columns of the CSV. Returns the mapping, or None if cancelled."""
-    import tkinter as tk
-    from tkinter import ttk, messagebox
-
-    NONE = "(nessuna)"
+    NONE = "(none)"
     names = [f"{i}: {h}" for i, h in enumerate(header)]
     example = next((r for r in rows if r and any(c.strip() for c in r)), [])
 
     def sample(i):
         v = example[i].strip() if i is not None and i < len(example) else ""
-        return f"es.: {v[:40]}" if v else ""
+        return f"e.g. {v[:40]}" if v else ""
 
     win = tk.Toplevel(root)
-    win.title("Colonne del vero/falso")
+    win.title("True/false columns")
     win.grab_set()
-    tk.Label(win, text="Controlla quali colonne del CSV usare (la prima riga di dati è "
-                       "mostrata come esempio).", font=("Arial", 11)).grid(
+    tk.Label(win, text="Check which CSV columns to use (the first data row is shown "
+                       "as an example).", font=("Arial", 11)).grid(
         row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 6))
     combos = {}
-    for r, (key, label, required) in enumerate(VF_FIELDS, start=1):
-        tk.Label(win, text=label + ("" if required else " (facoltativa)")).grid(
+    for r, (key, label, required) in enumerate(TF_FIELDS, start=1):
+        tk.Label(win, text=label + ("" if required else " (optional)")).grid(
             row=r, column=0, sticky="w", padx=10, pady=2)
         cb = ttk.Combobox(win, values=([] if required else [NONE]) + names,
                           state="readonly", width=38)
@@ -797,11 +861,11 @@ def choose_vf_columns(root, header, rows, guess):
             text=sample(names.index(cb.get()) if cb.get() in names else None)))
         combos[key] = cb
 
-    r = len(VF_FIELDS) + 1
+    r = len(TF_FIELDS) + 1
     lists = {}
-    for c, (key, label) in enumerate((("answers", "Risposte dello studente\n(una colonna per domanda)"),
-                                      ("points", "Punti di ogni domanda (facoltative,\n"
-                                                 "nello stesso ordine delle risposte)"))):
+    for c, (key, label) in enumerate((("answers", "Student's answers\n(one column per question)"),
+                                      ("points", "Points of each question (optional,\n"
+                                                 "in the same order as the answers)"))):
         f = tk.Frame(win)
         f.grid(row=r, column=c, columnspan=1 if c == 0 else 2, sticky="nsew", padx=10, pady=(10, 0))
         tk.Label(f, text=label, justify="left").pack(anchor="w")
@@ -822,7 +886,7 @@ def choose_vf_columns(root, header, rows, guess):
 
     def update_count(e=None):
         a, p = len(lists["answers"].curselection()), len(lists["points"].curselection())
-        count.config(text=f"Domande scelte: {a}   —   colonne di punti: {p}",
+        count.config(text=f"Questions chosen: {a}   —   points columns: {p}",
                      fg="gray" if p in (0, a) else "red")
     for lb in lists.values():
         lb.bind("<<ListboxSelect>>", update_count)
@@ -836,24 +900,24 @@ def choose_vf_columns(root, header, rows, guess):
             m[key] = names.index(cb.get()) if cb.get() in names else None
         m["answers"] = list(lists["answers"].curselection())
         m["points"] = list(lists["points"].curselection())
-        err = check_vf_columns(m)
+        err = check_tf_columns(m)
         if err:
-            messagebox.showwarning("Colonne", err, parent=win)
+            messagebox.showwarning("Columns", err, parent=win)
             return
         result["m"] = m
         win.destroy()
 
     bf = tk.Frame(win)
     bf.grid(row=r + 2, column=0, columnspan=3, pady=10)
-    tk.Button(bf, text="Annulla", width=12, command=win.destroy).pack(side=tk.LEFT, padx=5)
-    tk.Button(bf, text="Continua", width=12, command=ok).pack(side=tk.LEFT, padx=5)
+    tk.Button(bf, text="Cancel", width=12, command=win.destroy).pack(side=tk.LEFT, padx=5)
+    tk.Button(bf, text="Continue", width=12, command=ok).pack(side=tk.LEFT, padx=5)
     win.protocol("WM_DELETE_WINDOW", win.destroy)
     win.wait_window()
     return result.get("m")
 
 
 # ==================================================
-# Solutions (zip of LaTeX files, one per exam, compiled to PDF)
+# Solutions: a zip with one file per exam (compiled to PDF), or one PDF for everybody
 # ==================================================
 
 def _find_pdflatex():
@@ -865,14 +929,16 @@ def _find_pdflatex():
 
 
 class SolutionsCompiler:
-    """Compiles the solutions of each exam in a background thread.
+    """Gives the solutions PDF of each exam.
 
-    The zip holds one file per exam (.tex or .pdf), whose name ends with the exam number
-    (00012.tex -> 12). PDFs go to <folder>/soluzioni_pdf/ and are reused until the zip changes.
+    The source (from get_source()) is either one PDF for everybody, or a zip holding one
+    file per exam (.tex or .pdf) whose name ends with the exam number (00012.tex -> 12).
+    The .tex files are compiled in a background thread into out_dir and reused until the
+    zip changes.
     """
 
-    def __init__(self, zip_path, out_dir):
-        self.zip_path = zip_path
+    def __init__(self, get_source, out_dir):
+        self.get_source = get_source
         self.out_dir = out_dir
         self.pdflatex = _find_pdflatex()
         self.cond = threading.Condition()
@@ -880,43 +946,47 @@ class SolutionsCompiler:
         self.busy = None
         self.errors = {}         # {n: message}
         self.entries = {}        # {n: name in the zip}
-        self.zip_mtime = None
+        self.source = None       # path of the zip or of the single PDF
+        self.single = False      # one PDF for everybody
+        self.source_mtime = None
         self.work_dir = None
         self.thread = None
 
-    def _zip_mtime(self):
-        try:
-            return os.path.getmtime(self.zip_path)
-        except OSError:
-            return None
-
     def refresh(self):
-        """Re-reads the zip if it changed. Returns False if there is no zip."""
-        mtime = self._zip_mtime()
+        """Re-reads the source if it changed. Returns False if there are no solutions."""
+        src = self.get_source()
+        try:
+            mtime = os.path.getmtime(src) if src else None
+        except OSError:
+            mtime = None
         if mtime is None:
-            self.entries = {}
+            with self.cond:
+                self.entries, self.source, self.single = {}, None, False
             return False
-        if mtime != self.zip_mtime:
+        if src != self.source or mtime != self.source_mtime:
+            single = src.lower().endswith(".pdf")
             entries = {}
-            with zipfile.ZipFile(self.zip_path) as z:
-                for name in z.namelist():
-                    base = os.path.basename(name)
-                    stem, ext = os.path.splitext(base)
-                    nums = re.findall(r"\d+", stem)
-                    if ext.lower() in (".tex", ".pdf") and nums and not base.startswith("."):
-                        n = int(nums[-1])
-                        # a ready-made PDF wins over the LaTeX source
-                        if n not in entries or ext.lower() == ".pdf":
-                            entries[n] = name
+            if not single:
+                with zipfile.ZipFile(src) as z:
+                    for name in z.namelist():
+                        base = os.path.basename(name)
+                        stem, ext = os.path.splitext(base)
+                        nums = re.findall(r"\d+", stem)
+                        if ext.lower() in (".tex", ".pdf") and nums and not base.startswith("."):
+                            n = int(nums[-1])
+                            # a ready-made PDF wins over the LaTeX source
+                            if n not in entries or ext.lower() == ".pdf":
+                                entries[n] = name
             with self.cond:
                 self.cleanup()
+                self.queue = []
                 self.entries = entries
-                self.zip_mtime = mtime
+                self.source, self.single, self.source_mtime = src, single, mtime
                 self.errors = {}
         return True
 
     def has(self, n):
-        return n in self.entries
+        return self.single or n in self.entries
 
     def cleanup(self):
         """Removes the extracted zip (it is extracted again when needed)."""
@@ -925,15 +995,19 @@ class SolutionsCompiler:
         self.work_dir = None
 
     def pdf_path(self, n):
+        if self.single:
+            return self.source
         return os.path.join(self.out_dir, f"{n:05d}.pdf")
 
     def ready(self, n):
+        if self.single:
+            return self.source is not None and os.path.exists(self.source)
         p = self.pdf_path(n)
-        return os.path.exists(p) and self.zip_mtime is not None \
-            and os.path.getmtime(p) >= self.zip_mtime
+        return os.path.exists(p) and self.source_mtime is not None \
+            and os.path.getmtime(p) >= self.source_mtime
 
     def request(self, n, first=False):
-        if n not in self.entries or self.ready(n) or n in self.errors:
+        if self.single or n not in self.entries or self.ready(n) or n in self.errors:
             return
         with self.cond:
             if n in self.queue:
@@ -964,11 +1038,12 @@ class SolutionsCompiler:
 
     def _compile(self, n):
         name = self.entries[n]
+        zip_path = self.source
         os.makedirs(self.out_dir, exist_ok=True)
         work = self.work_dir
         if work is None or not os.path.isdir(work):
-            work = tempfile.mkdtemp(prefix="soluzioni_")
-            with zipfile.ZipFile(self.zip_path) as z:
+            work = tempfile.mkdtemp(prefix="solutions_")
+            with zipfile.ZipFile(zip_path) as z:
                 z.extractall(work)     # the other files of the zip may be needed (images...)
             self.work_dir = work
         src = os.path.join(work, name)
@@ -977,8 +1052,8 @@ class SolutionsCompiler:
             self._publish(src, out)
             return
         if not self.pdflatex:
-            raise RuntimeError("pdflatex non trovato: installa una distribuzione LaTeX "
-                               "(es. MacTeX) per vedere le soluzioni.")
+            raise RuntimeError("pdflatex not found: install a LaTeX distribution "
+                               "(e.g. MacTeX or TeX Live) to compile the solutions.")
         d, base = os.path.split(src)
         job = os.path.splitext(base)[0]
         r = subprocess.run([self.pdflatex, "-interaction=nonstopmode", "-halt-on-error",
@@ -987,7 +1062,7 @@ class SolutionsCompiler:
         pdf = os.path.join(d, job + ".pdf")
         if r.returncode != 0 or not os.path.exists(pdf):
             err = [l for l in r.stdout.splitlines() if l.startswith("!")]
-            raise RuntimeError(f"Errore LaTeX in {base}:\n" + ("\n".join(err[:3]) or r.stdout[-500:]))
+            raise RuntimeError(f"LaTeX error in {base}:\n" + ("\n".join(err[:3]) or r.stdout[-500:]))
         self._publish(pdf, out)
 
     @staticmethod
@@ -1006,21 +1081,21 @@ class SolutionsWindow:
         self.app = app
         self.compiler = app.sol_compiler
         self.n = None
-        self.images = []          # pages of the exam shown (PIL)
+        self.images = []          # pages shown (PIL)
         self.images_for = None
         self.tk_imgs = []
         self.zoom = 1.0           # relative to the window width
         self.prefetched = False
 
         self.win = tk.Toplevel(app.root)
-        self.win.title("Soluzioni")
+        self.win.title("Solutions")
         self.win.geometry(app.config.get("solutions_geometry", "800x900+60+60"))
         self.win.protocol("WM_DELETE_WINDOW", self.hide)
         tb = tk.Frame(self.win)
         tb.pack(fill="x", padx=5, pady=5)
         self.label = tk.Label(tb, font=("Arial", 13, "bold"), anchor="w")
         self.label.pack(side=tk.LEFT)
-        tk.Button(tb, text="Adatta", command=self.zoom_reset).pack(side=tk.RIGHT, padx=2)
+        tk.Button(tb, text="Fit", command=self.zoom_reset).pack(side=tk.RIGHT, padx=2)
         tk.Button(tb, text="Zoom −", command=lambda: self.set_zoom(self.zoom / 1.2)).pack(side=tk.RIGHT, padx=2)
         tk.Button(tb, text="Zoom +", command=lambda: self.set_zoom(self.zoom * 1.2)).pack(side=tk.RIGHT, padx=2)
         cf = tk.Frame(self.win)
@@ -1083,25 +1158,26 @@ class SolutionsWindow:
         if self.poll_job:
             self.win.after_cancel(self.poll_job)
             self.poll_job = None
-        self.label.config(text=f"Soluzioni — compito {n}")
+        self.label.config(text=f"Solutions — exam {n}")
         c = self.compiler
-        before = c.zip_mtime
+        before = (c.source, c.source_mtime)
         if not c.refresh():
-            self.message("Nessuno zip di soluzioni in questa cartella.\n"
-                         "Usa il pulsante «Soluzioni…» per sceglierlo.")
+            self.message("No solutions in this folder.\n"
+                         "Use the «Solutions…» button to choose them.")
             return
-        if c.zip_mtime != before:
-            self.prefetched = False      # new zip: compile everything again
+        if (c.source, c.source_mtime) != before:
+            self.prefetched = False      # new solutions: compile everything again
         if not c.has(n):
-            self.message(f"Nello zip non c'è un file per il compito {n}.")
+            self.message(f"The zip has no file for exam {n}.")
             return
         if c.ready(n):
-            if self.images_for != (n, c.zip_mtime):
+            key = (c.pdf_path(n), c.source_mtime)
+            if self.images_for != key:
                 try:
                     self.images = convert_from_path(c.pdf_path(n), dpi=SOLUTIONS_DPI)
-                    self.images_for = (n, c.zip_mtime)
+                    self.images_for = key
                 except Exception as e:
-                    self.message(f"Impossibile visualizzare le soluzioni:\n{e}")
+                    self.message(f"Cannot show the solutions:\n{e}")
                     return
                 self.canvas.yview_moveto(0)
             self.draw()
@@ -1110,13 +1186,13 @@ class SolutionsWindow:
         if n in c.errors:
             self.message(c.errors[n])
             return
-        self.message("Compilazione delle soluzioni in corso…")
+        self.message("Compiling the solutions…")
         c.request(n, first=True)
         self.poll_job = self.win.after(300, lambda: self.show(n) if self.n == n else None)
 
     def prefetch(self):
         """Compiles the other exams in the background, in grading order."""
-        if self.prefetched:
+        if self.prefetched or self.compiler.single:
             return
         self.prefetched = True
         start = self.app.current_index
@@ -1165,7 +1241,7 @@ class SolutionsWindow:
 class PDFAnnotatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Correzione compiti PDF")
+        self.root.title("PDF exam grader")
         self.root.geometry("1400x900")
         self.ok = False
 
@@ -1174,6 +1250,7 @@ class PDFAnnotatorApp:
 
         self.grades = None
         self.folder = ""
+        self.paths = {}          # program files in the PDF folder (see FOLDER_FILES)
         self.pdf_files = []      # list of (exam_number, path)
         self.current_index = 0
         self.current_page = 1
@@ -1189,23 +1266,22 @@ class PDFAnnotatorApp:
         self.erasing = False
         self.solutions = None    # SolutionsWindow
         self.sol_compiler = None # SolutionsCompiler (solutions PDFs, also appended on save)
-        self.vf = None           # true/false data from the CSV (see setup_vf)
+        self.tf = None           # true/false data from the CSV (see setup_tf)
 
         self.rubric = []         # parsed rubric (see parse_rubric)
-        self.proposals = {}      # {"12": {...}} from proposte.json
+        self.proposals = {}      # {"12": {...}} from proposals.json
         self.proposals_mtime = None
         self.proposal_shown = False   # the comment box holds a proposal
 
         if not self.open_grades() or not self.open_folder() or not self.setup_rubric():
             return
-        if not os.path.exists(self.solutions_path()):
+        if not self.solutions_path():
             self.choose_solutions(startup=True)
-        self.sol_compiler = SolutionsCompiler(self.solutions_path(),
-                                              os.path.join(self.folder, SOLUTIONS_PDF_DIR))
-        self.setup_vf()
+        self.sol_compiler = SolutionsCompiler(self.solutions_path, self.paths["compiled"])
+        self.setup_tf()
         self.build_ui()
         self.current_index = self.first_ungraded_index()
-        if os.path.exists(self.solutions_path()):
+        if self.solutions_path():
             self.solutions = SolutionsWindow(self)
         self.load_pdf()
         self.ok = True
@@ -1215,11 +1291,11 @@ class PDFAnnotatorApp:
     # --------------------------------------------------
 
     def open_grades(self):
-        last = self.config.get("excel")
+        last = self.config.get("grades_file", self.config.get("excel"))
         path = filedialog.askopenfilename(
-            title="Seleziona il file con l'elenco degli studenti (Excel o CSV)",
+            title="Choose the file with the student list (Excel or CSV)",
             initialdir=os.path.dirname(last) if last else None,
-            filetypes=[("Excel o CSV", "*.xlsx *.xlsm *.csv"), ("Tutti i file", "*.*")])
+            filetypes=[("Excel or CSV", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")])
         if not path:
             return False
         try:
@@ -1228,47 +1304,98 @@ class PDFAnnotatorApp:
             else:
                 self.grades = ExcelGrades(path)
         except Exception as e:
-            messagebox.showerror("Errore", f"Impossibile leggere il file:\n{e}")
+            messagebox.showerror("Error", f"Cannot read the file:\n{e}")
             return False
 
         if self.grades.questions_from_rubric:
-            msg = ("Gli esercizi e i loro punteggi massimi si definiscono nella griglia "
-                   "di valutazione.")
+            msg = "The exercises and their maximum scores are defined in the grading rubric."
         else:
             qs = ", ".join(
                 f"{q[0]} (max {fmt_num(q[2])}"
                 + (f", min {fmt_num(self.grades.minimums[q[0]])})"
                    if self.grades.minimums[q[0]] else ")")
                 for q in self.grades.questions)
-            msg = f"Domande da correggere:\n{qs}"
-        msg += f"\n\nStudenti trovati: {len(self.grades.rows)}"
+            msg = f"Questions to grade:\n{qs}"
+        msg += f"\n\nStudents found: {len(self.grades.rows)}"
         if self.grades.duplicates:
-            msg += f"\n\nATTENZIONE: numeri di compito duplicati: {self.grades.duplicates}"
+            msg += f"\n\nWARNING: duplicate exam numbers: {self.grades.duplicates}"
         if self.grades.lock_file_exists():
-            msg += ("\n\nATTENZIONE: il file sembra aperto in Excel. Chiudilo prima di "
-                    "salvare, altrimenti Excel potrebbe sovrascrivere i punteggi.")
-        if not messagebox.askokcancel(f"File {self.grades.kind}", msg):
+            msg += ("\n\nWARNING: the file seems to be open in Excel. Close it before "
+                    "saving, otherwise Excel may overwrite the scores.")
+        if not messagebox.askokcancel(f"{self.grades.kind} file", msg):
             return False
-        self.config["excel"] = path
+        self.config["grades_file"] = path
+        self.config.pop("excel", None)
         save_config(self.config)
         return True
+
+    def open_folder(self):
+        folder = filedialog.askdirectory(
+            title="Choose the folder with the exam PDFs",
+            initialdir=self.config.get("folder"))
+        if not folder:
+            return False
+        files, no_number, not_in_list, seen = [], [], [], {}
+        for f in os.listdir(folder):
+            if not f.lower().endswith(".pdf") or f.startswith("."):
+                continue
+            if f == FOLDER_FILES["solutions_pdf"][0]:
+                continue                          # the solutions for everybody, not an exam
+            n = exam_number(f)
+            if n is None:
+                no_number.append(f)
+            elif n not in self.grades.rows:
+                not_in_list.append(f)
+            elif n in seen:
+                messagebox.showerror("Error", f"Two PDFs for exam {n}:\n{seen[n]}\n{f}")
+                return False
+            else:
+                seen[n] = f
+                files.append((n, os.path.join(folder, f)))
+        if not files:
+            messagebox.showerror("Error", "No PDF matches an exam of the list.")
+            return False
+        files.sort()
+
+        warn = []
+        if no_number:
+            warn.append("PDFs without a number in the name (ignored):\n  " + "\n  ".join(no_number))
+        if not_in_list:
+            warn.append("PDFs whose number is not in the list (ignored):\n  "
+                        + "\n  ".join(not_in_list))
+        missing = sorted(set(self.grades.rows) - set(seen))
+        if missing:
+            warn.append(f"Exams in the list without a PDF: {missing}")
+        if warn:
+            messagebox.showwarning("Warning", "\n\n".join(warn))
+
+        self.folder = folder
+        self.paths = {k: folder_path(folder, k) for k in FOLDER_FILES}
+        self.pdf_files = files
+        self.config["folder"] = folder
+        save_config(self.config)
+        self.load_state()
+        return True
+
+    def first_ungraded_index(self):
+        for i, (n, _) in enumerate(self.pdf_files):
+            if not self.grades.is_graded(n):
+                return i
+        return 0
 
     # --------------------------------------------------
     # Rubric
     # --------------------------------------------------
 
-    def rubric_path(self):
-        return os.path.join(self.folder, RUBRIC_NAME)
-
     def read_rubric_text(self):
         try:
-            with open(self.rubric_path(), "r", encoding="utf-8") as f:
+            with open(self.paths["rubric"], "r", encoding="utf-8") as f:
                 return f.read()
         except FileNotFoundError:
             return None
 
     def setup_rubric(self):
-        """Loads griglia.txt; if missing, asks for it (required for a CSV file)."""
+        """Loads the rubric; if missing, asks for it (required for a CSV file)."""
         text = self.read_rubric_text()
         if text is not None:
             try:
@@ -1279,31 +1406,31 @@ class PDFAnnotatorApp:
             if not problem:
                 self.apply_rubric(rubric)
                 return True
-            messagebox.showwarning("Griglia di valutazione",
-                                   f"{RUBRIC_NAME} va corretta:\n{problem}")
+            messagebox.showwarning("Grading rubric",
+                                   f"{os.path.basename(self.paths['rubric'])} needs fixing:\n{problem}")
         elif not self.grades.questions_from_rubric:
             if not messagebox.askyesno(
-                    "Griglia di valutazione",
-                    "Nella cartella non c'è ancora la griglia di valutazione.\n\n"
-                    "Vuoi scriverla ora? (serve per le proposte di valutazione; "
-                    "puoi farlo anche dopo col pulsante «Griglia…»)"):
+                    "Grading rubric",
+                    "There is no grading rubric in the folder yet.\n\n"
+                    "Write it now? (it is used for the grading proposals; "
+                    "you can also do it later with the «Rubric…» button)"):
                 return True
         return self.edit_rubric(startup=True)
 
     def check_rubric(self, rubric):
-        """Error message, or "" if the rubric can be used with the grades file."""
+        """Error message, or "" if the rubric can be used with the score file."""
         if self.grades.questions_from_rubric:
             if not rubric:
-                return "Scrivi almeno un esercizio, es. [Esercizio 1]."
+                return "Write at least one exercise, e.g. [Exercise 1]."
             empty = [e["name"] for e in rubric if e["max"] <= 0]
             if empty:
-                return f"Esercizi senza punti positivi: {', '.join(empty)}"
+                return f"Exercises without positive points: {', '.join(empty)}"
             return ""
         known = {q[0] for q in self.grades.questions}
         unknown = [e["name"] for e in rubric if e["name"] not in known]
         if unknown:
-            return (f"Esercizi che non sono colonne dell'Excel: {', '.join(unknown)}\n"
-                    f"Colonne: {', '.join(q[0] for q in self.grades.questions)}")
+            return (f"Exercises that are not columns of the Excel file: {', '.join(unknown)}\n"
+                    f"Columns: {', '.join(q[0] for q in self.grades.questions)}")
         return ""
 
     def rubric_mismatches(self, rubric):
@@ -1311,7 +1438,7 @@ class PDFAnnotatorApp:
         if self.grades.questions_from_rubric:
             return []
         qmax = {q[0]: q[2] for q in self.grades.questions}
-        return [f"{e['name']}: griglia {fmt_num(e['max'])}, Excel {fmt_num(qmax[e['name']])}"
+        return [f"{e['name']}: rubric {fmt_num(e['max'])}, Excel {fmt_num(qmax[e['name']])}"
                 for e in rubric if e["criteria"] and abs(e["max"] - qmax[e["name"]]) > 1e-9]
 
     def apply_rubric(self, rubric):
@@ -1324,12 +1451,12 @@ class PDFAnnotatorApp:
         text = self.read_rubric_text()
         if text is None:
             if self.grades.questions_from_rubric:
-                text = rubric_template([("Esercizio 1", 0), ("Esercizio 2", 0)])
+                text = rubric_template([("Exercise 1", 0), ("Exercise 2", 0)])
             else:
                 text = rubric_template([(q[0], q[2]) for q in self.grades.questions])
 
         win = tk.Toplevel(self.root)
-        win.title("Griglia di valutazione")
+        win.title("Grading rubric")
         win.geometry("760x600")
         win.transient(self.root)
         tk.Label(win, text=RUBRIC_HELP, justify="left", anchor="w",
@@ -1343,18 +1470,18 @@ class PDFAnnotatorApp:
             try:
                 rubric = parse_rubric(box.get("1.0", tk.END))
             except ValueError as e:
-                messagebox.showerror("Griglia", str(e), parent=win)
+                messagebox.showerror("Rubric", str(e), parent=win)
                 return
             problem = self.check_rubric(rubric)
             if problem:
-                messagebox.showerror("Griglia", problem, parent=win)
+                messagebox.showerror("Rubric", problem, parent=win)
                 return
             mism = self.rubric_mismatches(rubric)
             if mism and not messagebox.askyesno(
-                    "Griglia", "La somma dei punti non coincide con il massimo:\n"
-                    + "\n".join(mism) + "\n\nSalvare comunque?", parent=win):
+                    "Rubric", "The sum of the points differs from the maximum:\n"
+                    + "\n".join(mism) + "\n\nSave anyway?", parent=win):
                 return
-            with open(self.rubric_path(), "w", encoding="utf-8") as f:
+            with open(self.paths["rubric"], "w", encoding="utf-8") as f:
                 f.write(box.get("1.0", "end-1c").rstrip() + "\n")
             values = self.current_entry_values() if hasattr(self, "score_frame") else None
             self.apply_rubric(rubric)
@@ -1365,8 +1492,8 @@ class PDFAnnotatorApp:
 
         bf = tk.Frame(win)
         bf.pack(fill="x", padx=10, pady=(0, 10))
-        tk.Button(bf, text="Salva", width=12, bg="lightgreen", command=save).pack(side=tk.RIGHT)
-        tk.Button(bf, text="Annulla", width=12, command=win.destroy).pack(side=tk.RIGHT, padx=5)
+        tk.Button(bf, text="Save", width=12, bg="lightgreen", command=save).pack(side=tk.RIGHT)
+        tk.Button(bf, text="Cancel", width=12, command=win.destroy).pack(side=tk.RIGHT, padx=5)
         win.grab_set()
         box.focus_set()
         self.root.wait_window(win)
@@ -1375,32 +1502,40 @@ class PDFAnnotatorApp:
         return True
 
     # --------------------------------------------------
-    # Solutions (zip with the LaTeX files, read by Claude for the proposals)
+    # Solutions (zip with one file per exam, or one PDF for everybody)
     # --------------------------------------------------
 
     def solutions_path(self):
-        return os.path.join(self.folder, SOLUTIONS_NAME)
+        """The most recently chosen solutions (zip or PDF) in the folder, or None."""
+        found = [p for p in (self.paths["solutions_zip"], self.paths["solutions_pdf"])
+                 if os.path.exists(p)]
+        return max(found, key=os.path.getmtime) if found else None
 
     def choose_solutions(self, startup=False):
-        """Copies the solutions zip into the PDF folder as soluzioni.zip."""
+        """Copies the solutions (zip or PDF) into the PDF folder."""
         if startup and not messagebox.askyesno(
-                "Soluzioni",
-                "Per le proposte di valutazione servono le soluzioni (zip con i file LaTeX).\n\n"
-                "Vuoi sceglierle ora? (puoi farlo anche dopo col pulsante «Soluzioni…»)"):
+                "Solutions",
+                "Do you want to choose the solutions now?\n\n"
+                "Either a zip with one file per exam (.tex or .pdf, named after the exam "
+                "number) or a single PDF for everybody. They are shown in a second window, "
+                "can be appended to each student's PDF and are read by Claude for the "
+                "grading proposals.\n\n(You can also do it later with «Solutions…».)"):
             return
         path = filedialog.askopenfilename(
-            title="Seleziona lo zip con le soluzioni LaTeX",
-            initialdir=self.folder, filetypes=[("Zip", "*.zip"), ("Tutti i file", "*.*")])
+            title="Choose the solutions (zip or PDF)",
+            initialdir=self.folder,
+            filetypes=[("Zip or PDF", "*.zip *.pdf"), ("All files", "*.*")])
         if not path:
             return
-        if os.path.abspath(path) != os.path.abspath(self.solutions_path()):
-            shutil.copy2(path, self.solutions_path())
-            os.utime(self.solutions_path())   # newer than the PDFs compiled from the old zip
+        dest = self.paths["solutions_pdf" if path.lower().endswith(".pdf") else "solutions_zip"]
+        if os.path.abspath(path) != os.path.abspath(dest):
+            shutil.copy2(path, dest)
+        os.utime(dest)   # newest: wins over the other kind, and over PDFs compiled from an old zip
         messagebox.showinfo(
-            "Soluzioni",
-            f"Soluzioni copiate in:\n{self.solutions_path()}\n\n"
-            "Ora chiedi a Claude (in Claude Code) di preparare le proposte per questa "
-            f"cartella:\n{self.folder}\n\nCompariranno qui man mano che sono pronte.")
+            "Solutions",
+            f"Solutions copied to:\n{dest}\n\n"
+            "If you use Claude Code for the grading proposals, ask Claude to prepare "
+            f"them for this folder:\n{self.folder}\nThey appear here as soon as they are ready.")
         if hasattr(self, "label_proposal") and self.pdf_files:
             self.load_pdf()
             self.show_solutions()
@@ -1416,64 +1551,76 @@ class PDFAnnotatorApp:
     # Extra pages of the PDF: true/false page and solutions
     # --------------------------------------------------
 
-    def setup_vf(self):
-        """True/false data from the CSV of Correggi VF: columns saved for this folder,
-        otherwise guessed from the names. Nothing for an Excel file."""
-        self.vf = None
+    def setup_tf(self):
+        """True/false data from the CSV: columns saved for this folder, otherwise
+        guessed from the names. Nothing for an Excel file."""
+        self.tf = None
         if not isinstance(self.grades, CsvGrades):
             return
         header = self.grades.header
-        m = self._vf_columns_from_state(header) or guess_vf_columns(header)
-        if check_vf_columns(m) is None:
-            self._set_vf(m)
+        m = self._tf_columns_from_state(header) or guess_tf_columns(header)
+        if check_tf_columns(m) is None:
+            self._set_tf(m)
 
-    def _set_vf(self, m):
-        students, questions, max_points = vf_students(self.grades.header, self.grades.data[1:], m)
-        self.vf = {"columns": m, "students": students, "questions": questions, "max": max_points}
+    def _set_tf(self, m):
+        students, questions, max_points = tf_students(self.grades.header, self.grades.data[1:], m)
+        self.tf = {"columns": m, "students": students, "questions": questions, "max": max_points}
 
-    def _vf_columns_from_state(self, header):
-        saved = self.state.get("vf_columns")
+    def _tf_columns_from_state(self, header):
+        saved = self.state.get("tf_columns")
+        if not saved and self.state.get("vf_columns"):     # saved by an older version
+            saved = {_OLD_TF_KEYS.get(k, k): v for k, v in self.state["vf_columns"].items()}
         if not saved:
             return None
         try:
             idx = lambda name: None if name is None else header.index(name)
-            m = {k: idx(saved.get(k)) for k, _, _ in VF_FIELDS}
+            m = {k: idx(saved.get(k)) for k, _, _ in TF_FIELDS}
             m["answers"] = [header.index(x) for x in saved.get("answers", [])]
             m["points"] = [header.index(x) for x in saved.get("points", [])]
         except ValueError:            # a saved column is no longer in the file
             return None
         return m
 
-    def choose_vf(self):
+    def choose_tf(self):
         header = self.grades.header
-        guess = self.vf["columns"] if self.vf else guess_vf_columns(header)
-        m = choose_vf_columns(self.root, header, self.grades.data[1:], guess)
+        guess = self.tf["columns"] if self.tf else guess_tf_columns(header)
+        m = choose_tf_columns(self.root, header, self.grades.data[1:], guess)
         if m is None:
             return
         try:
-            self._set_vf(m)
+            self._set_tf(m)
         except Exception as e:
-            messagebox.showerror("Colonne V/F", str(e))
+            messagebox.showerror("True/false columns", str(e))
             return
         name = lambda i: None if i is None else header[i]
-        saved = {k: name(m.get(k)) for k, _, _ in VF_FIELDS}
+        saved = {k: name(m.get(k)) for k, _, _ in TF_FIELDS}
         saved["answers"] = [header[i] for i in m["answers"]]
         saved["points"] = [header[i] for i in m["points"]]
-        self.state["vf_columns"] = saved
-        self.opt_vf.set(True)
+        self.state["tf_columns"] = saved
+        self.state.pop("vf_columns", None)
+        self.opt_tf.set(True)
         self.save_options()
 
+    def options(self):
+        """Folder options saved in the state (older versions used the key "vf")."""
+        o = self.state.get("options", {})
+        return {"true_false": o.get("true_false", o.get("vf", True)),
+                "solutions": o.get("solutions", True),
+                "english_default": o.get("english_default", False)}
+
     def save_options(self):
-        self.state["options"] = {"vf": self.opt_vf.get(), "solutions": self.opt_solutions.get()}
+        self.state["options"] = {"true_false": self.opt_tf.get(),
+                                 "solutions": self.opt_solutions.get(),
+                                 "english_default": self.english_default.get()}
         self.save_state()
 
     def solution_pdf(self, n):
         """(path of the solutions PDF of exam n, None) or (None, reason). Compiles it now if needed."""
         c = self.sol_compiler
         if not c.refresh():
-            return None, "manca lo zip delle soluzioni («Soluzioni…»)"
+            return None, "no solutions chosen («Solutions…»)"
         if not c.has(n):
-            return None, f"nello zip non c'è la soluzione del compito {n}"
+            return None, f"the zip has no solution for exam {n}"
         if not c.ready(n) and n not in c.errors:
             c.request(n, first=True)
             self.root.config(cursor="watch")
@@ -1484,25 +1631,29 @@ class PDFAnnotatorApp:
             self.root.config(cursor="")
         if c.ready(n):
             return c.pdf_path(n), None
-        return None, c.errors.get(n, "compilazione troppo lunga")
+        return None, c.errors.get(n, "compilation took too long")
 
     def extra_pages(self, n, english):
         """(true/false page or None, solutions PDF or None, notes on what is missing)."""
         first = solutions = None
         notes = []
-        if self.opt_vf.get():
-            if self.vf is None:
-                notes.append("pagina V/F: scegli le colonne con «Colonne V/F…»")
-            elif n not in self.vf["students"]:
-                notes.append(f"pagina V/F: il compito {n} non è nel CSV")
+        if self.opt_tf.get():
+            if self.tf is None:
+                notes.append("true/false page: choose the columns with «T/F columns…»")
+            elif n not in self.tf["students"]:
+                notes.append(f"true/false page: exam {n} is not in the CSV")
             else:
-                first = true_false_page(n, self.vf["students"][n], self.vf["questions"],
-                                        self.vf["max"], self.fonts, english)
+                first = true_false_page(n, self.tf["students"][n], self.tf["questions"],
+                                        self.tf["max"], self.fonts, english)
         if self.opt_solutions.get():
             solutions, why = self.solution_pdf(n)
             if why:
-                notes.append("soluzioni: " + why)
+                notes.append("solutions: " + why)
         return first, solutions, notes
+
+    def exam_english(self, saved):
+        """Language of the student pages of an exam: as saved, else the folder default."""
+        return bool(saved.get("english", self.english_default.get()))
 
     def regenerate_all(self):
         """Rebuilds the PDF of every graded exam with the current options."""
@@ -1510,22 +1661,22 @@ class PDFAnnotatorApp:
         todo = [(k, p) for k, p in self.pdf_files
                 if self.grades.is_graded(k) and os.path.exists(self.original_path(p))]
         if not todo:
-            messagebox.showinfo("Rigenera PDF", "Nessun compito già corretto.")
+            messagebox.showinfo("Rebuild PDFs", "No exam graded yet.")
             return
-        yes_no = lambda v: "sì" if v else "no"
+        yes_no = lambda v: "yes" if v else "no"
         if not messagebox.askyesno(
-                "Rigenera PDF",
-                f"Rifaccio il PDF dei {len(todo)} compiti già corretti, con le opzioni attuali:\n"
-                f"  pagina V/F: {yes_no(self.opt_vf.get())}\n"
-                f"  soluzioni in coda: {yes_no(self.opt_solutions.get())}\n\n"
-                "Punteggi, commenti, disegni e lingua restano quelli salvati."):
+                "Rebuild PDFs",
+                f"Rebuild the PDF of the {len(todo)} graded exams with the current options:\n"
+                f"  true/false page: {yes_no(self.opt_tf.get())}\n"
+                f"  solutions appended: {yes_no(self.opt_solutions.get())}\n\n"
+                "Scores, comments, drawings and language stay as saved."):
             return
         problems = []
         for i, (k, p) in enumerate(todo, start=1):
-            self.label_status.config(text=f"Rigenero i PDF: {i}/{len(todo)}…")
+            self.label_status.config(text=f"Rebuilding the PDFs: {i}/{len(todo)}…")
             self.root.update_idletasks()
             saved = self.state["files"].get(os.path.basename(p), {})
-            english = bool(saved.get("english"))
+            english = self.exam_english(saved)
             first, solutions, notes = self.extra_pages(k, english)
             problems += [f"{k}: {x}" for x in notes]
             try:
@@ -1537,109 +1688,61 @@ class PDFAnnotatorApp:
             except Exception as e:
                 problems.append(f"{k}: {e}")
         self.load_pdf()
-        report = f"PDF rifatti: {len(todo)}."
+        report = f"PDFs rebuilt: {len(todo)}."
         if problems:
-            report += "\n\nProblemi:\n" + "\n".join(problems[:30])
+            report += "\n\nProblems:\n" + "\n".join(problems[:30])
             if len(problems) > 30:
-                report += f"\n… e altri {len(problems) - 30}"
-        (messagebox.showwarning if problems else messagebox.showinfo)("Rigenera PDF", report)
+                report += f"\n… and {len(problems) - 30} more"
+        (messagebox.showwarning if problems else messagebox.showinfo)("Rebuild PDFs", report)
 
     # --------------------------------------------------
-    # Proposals (proposte.json, written by Claude)
+    # Proposals (proposals.json, e.g. written by Claude)
     # --------------------------------------------------
-
-    def proposals_path(self):
-        return os.path.join(self.folder, PROPOSALS_NAME)
 
     def reload_proposals(self):
-        """Re-reads proposte.json if it changed (it may be written while grading)."""
+        """Re-reads the proposals if they changed (they may be written while grading)."""
+        path = self.paths["proposals"]
         try:
-            mtime = os.path.getmtime(self.proposals_path())
+            mtime = os.path.getmtime(path)
         except OSError:
             self.proposals, self.proposals_mtime = {}, None
             return
         if mtime == self.proposals_mtime:
             return
         try:
-            with open(self.proposals_path(), "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.proposals = {str(k): v for k, v in data.items() if isinstance(v, dict)}
             self.proposals_mtime = mtime
         except Exception as e:
-            messagebox.showwarning("Proposte", f"Impossibile leggere {PROPOSALS_NAME}:\n{e}")
+            messagebox.showwarning("Proposals", f"Cannot read {os.path.basename(path)}:\n{e}")
             self.proposals, self.proposals_mtime = {}, mtime
 
     def proposal(self, n):
         return self.proposals.get(str(n))
 
-    def proposal_comment(self, prop, english):
+    @staticmethod
+    def proposal_comment(prop, english):
+        """Proposed comment for the English or Italian page ("comment" fits both;
+        "commento" is the key used by older versions)."""
         if not prop:
             return ""
-        return str(prop.get("comment_en" if english else "commento") or "").strip()
+        keys = ("comment_en", "comment") if english else ("comment_it", "commento", "comment")
+        return str(next((prop[k] for k in keys if prop.get(k)), "")).strip()
+
+    @staticmethod
+    def proposal_scores(prop):
+        return (prop or {}).get("scores") or (prop or {}).get("punteggi") or {}
 
     def proposal_score(self, prop, qname):
         """Proposed score for a question, if valid."""
-        v = (prop or {}).get("punteggi", {}).get(qname)
+        v = self.proposal_scores(prop).get(qname)
         if isinstance(v, str):
-            try:
-                v = parse_num(v)
-            except ValueError:
-                return None
+            v = to_float(v)
         if not _is_number(v):
             return None
         q = next(q for q in self.grades.questions if q[0] == qname)
         return float(v) if self.grades.minimums[qname] <= v <= q[2] else None
-
-    def open_folder(self):
-        folder = filedialog.askdirectory(
-            title="Seleziona la cartella con i PDF",
-            initialdir=self.config.get("folder"))
-        if not folder:
-            return False
-        files, no_number, not_in_excel, seen = [], [], [], {}
-        for f in os.listdir(folder):
-            if not f.lower().endswith(".pdf") or f.startswith("."):
-                continue
-            n = compito_number(f)
-            if n is None:
-                no_number.append(f)
-            elif n not in self.grades.rows:
-                not_in_excel.append(f)
-            elif n in seen:
-                messagebox.showerror("Errore", f"Due PDF per il compito {n}:\n{seen[n]}\n{f}")
-                return False
-            else:
-                seen[n] = f
-                files.append((n, os.path.join(folder, f)))
-        if not files:
-            messagebox.showerror("Errore", "Nessun PDF associabile a un compito dell'elenco.")
-            return False
-        files.sort()
-
-        warn = []
-        if no_number:
-            warn.append("PDF senza numero nel nome (ignorati):\n  " + "\n  ".join(no_number))
-        if not_in_excel:
-            warn.append("PDF con numero non presente nell'elenco (ignorati):\n  "
-                        + "\n  ".join(not_in_excel))
-        missing = sorted(set(self.grades.rows) - set(seen))
-        if missing:
-            warn.append(f"Compiti nell'elenco senza PDF: {missing}")
-        if warn:
-            messagebox.showwarning("Attenzione", "\n\n".join(warn))
-
-        self.folder = folder
-        self.pdf_files = files
-        self.config["folder"] = folder
-        save_config(self.config)
-        self.load_state()
-        return True
-
-    def first_ungraded_index(self):
-        for i, (n, _) in enumerate(self.pdf_files):
-            if not self.grades.is_graded(n):
-                return i
-        return 0
 
     # --------------------------------------------------
     # UI
@@ -1661,24 +1764,24 @@ class PDFAnnotatorApp:
         left.pack(side=tk.LEFT, fill="both", expand=True)
         tb = tk.Frame(left)
         tb.pack(fill="x", pady=(0, 5))
-        tk.Button(tb, text="◀ Pagina", command=self.prev_page).pack(side=tk.LEFT, padx=2)
+        tk.Button(tb, text="◀ Page", command=self.prev_page).pack(side=tk.LEFT, padx=2)
         self.page_label = tk.Label(tb, text="1/1", width=8)
         self.page_label.pack(side=tk.LEFT, padx=2)
-        tk.Button(tb, text="Pagina ▶", command=self.next_page).pack(side=tk.LEFT, padx=2)
+        tk.Button(tb, text="Page ▶", command=self.next_page).pack(side=tk.LEFT, padx=2)
         tk.Label(tb, text="|").pack(side=tk.LEFT, padx=5)
         tk.Button(tb, text="Zoom +", command=self.zoom_in).pack(side=tk.LEFT, padx=2)
         tk.Button(tb, text="Zoom −", command=self.zoom_out).pack(side=tk.LEFT, padx=2)
-        tk.Button(tb, text="Adatta", command=self.zoom_reset).pack(side=tk.LEFT, padx=2)
+        tk.Button(tb, text="Fit", command=self.zoom_reset).pack(side=tk.LEFT, padx=2)
         tk.Label(tb, text="|").pack(side=tk.LEFT, padx=5)
         self.tool_var = tk.StringVar(value="pen")
-        tk.Radiobutton(tb, text="✎ Penna", variable=self.tool_var, value="pen",
+        tk.Radiobutton(tb, text="✎ Pen", variable=self.tool_var, value="pen",
                        indicatoron=False, padx=6).pack(side=tk.LEFT, padx=2)
-        tk.Radiobutton(tb, text="⌫ Gomma", variable=self.tool_var, value="eraser",
+        tk.Radiobutton(tb, text="⌫ Eraser", variable=self.tool_var, value="eraser",
                        indicatoron=False, padx=6).pack(side=tk.LEFT, padx=2)
-        tk.Button(tb, text="Annulla", command=self.undo).pack(side=tk.LEFT, padx=2)
-        tk.Button(tb, text="Cancella pagina", command=self.clear_annotations).pack(side=tk.LEFT, padx=2)
+        tk.Button(tb, text="Undo", command=self.undo).pack(side=tk.LEFT, padx=2)
+        tk.Button(tb, text="Clear page", command=self.clear_annotations).pack(side=tk.LEFT, padx=2)
         tk.Label(tb, text="|").pack(side=tk.LEFT, padx=5)
-        tk.Button(tb, text="Soluzioni ⧉", command=self.show_solutions).pack(side=tk.LEFT, padx=2)
+        tk.Button(tb, text="Solutions ⧉", command=self.show_solutions).pack(side=tk.LEFT, padx=2)
 
         cf = tk.Frame(left, relief="sunken", borderwidth=2)
         cf.pack(fill="both", expand=True)
@@ -1715,31 +1818,34 @@ class PDFAnnotatorApp:
                                       anchor="w", wraplength=400)
         self.label_student.pack(fill="x", padx=5, pady=(0, 5))
 
+        options = self.options()
         opts = tk.Frame(right)
         opts.pack(fill="x", padx=5)
-        tk.Button(opts, text="Griglia…", command=self.edit_rubric).pack(side=tk.LEFT, padx=2)
-        tk.Button(opts, text="Soluzioni…", command=self.choose_solutions).pack(side=tk.LEFT, padx=2)
+        tk.Button(opts, text="Rubric…", command=self.edit_rubric).pack(side=tk.LEFT, padx=2)
+        tk.Button(opts, text="Solutions…", command=self.choose_solutions).pack(side=tk.LEFT, padx=2)
         self.english_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(opts, text="Inglese", variable=self.english_var,
+        tk.Checkbutton(opts, text="English", variable=self.english_var,
                        command=self.toggle_english,
                        font=("Arial", 11, "bold")).pack(side=tk.RIGHT, padx=2)
+        self.english_default = tk.BooleanVar(value=options["english_default"])
+        tk.Checkbutton(opts, text="English by default", variable=self.english_default,
+                       command=self.toggle_english_default).pack(side=tk.RIGHT)
 
         # What goes into the PDF besides the exam and the evaluation page
         opts2 = tk.Frame(right)
         opts2.pack(fill="x", padx=5, pady=(3, 0))
-        options = self.state.get("options", {})
         is_csv = isinstance(self.grades, CsvGrades)
-        self.opt_vf = tk.BooleanVar(value=is_csv and options.get("vf", True))
-        self.opt_solutions = tk.BooleanVar(value=options.get("solutions", True))
-        tk.Checkbutton(opts2, text="Pagina V/F", variable=self.opt_vf, command=self.save_options,
+        self.opt_tf = tk.BooleanVar(value=is_csv and options["true_false"])
+        self.opt_solutions = tk.BooleanVar(value=options["solutions"])
+        tk.Checkbutton(opts2, text="T/F page", variable=self.opt_tf, command=self.save_options,
                        state="normal" if is_csv else "disabled").pack(side=tk.LEFT)
-        tk.Button(opts2, text="Colonne V/F…", command=self.choose_vf,
+        tk.Button(opts2, text="T/F columns…", command=self.choose_tf,
                   state="normal" if is_csv else "disabled").pack(side=tk.LEFT, padx=(0, 6))
-        tk.Checkbutton(opts2, text="Soluzioni in coda", variable=self.opt_solutions,
+        tk.Checkbutton(opts2, text="Append solutions", variable=self.opt_solutions,
                        command=self.save_options).pack(side=tk.LEFT)
-        tk.Button(opts2, text="Rigenera PDF…", command=self.regenerate_all).pack(side=tk.RIGHT)
+        tk.Button(opts2, text="Rebuild PDFs…", command=self.regenerate_all).pack(side=tk.RIGHT)
 
-        self.score_frame = tk.LabelFrame(right, text="Punteggi", font=("Arial", 10, "bold"))
+        self.score_frame = tk.LabelFrame(right, text="Scores", font=("Arial", 10, "bold"))
         self.score_frame.pack(fill="x", padx=5, pady=5)
         self.score_entries = []
         self.total_label = None
@@ -1752,35 +1858,35 @@ class PDFAnnotatorApp:
 
         nav = tk.Frame(right)
         nav.pack(fill="x", padx=5, pady=5)
-        tk.Button(nav, text="◀ Precedente", command=self.previous_student,
+        tk.Button(nav, text="◀ Previous", command=self.previous_student,
                   width=14).pack(side=tk.LEFT, padx=2)
-        tk.Button(nav, text="Salva e continua ▶", command=self.save_and_next,
+        tk.Button(nav, text="Save and continue ▶", command=self.save_and_next,
                   width=18, bg="lightblue").pack(side=tk.RIGHT, padx=2)
         nav2 = tk.Frame(right)
         nav2.pack(fill="x", padx=5)
-        tk.Button(nav2, text="Vai al compito…", command=self.goto_compito,
+        tk.Button(nav2, text="Go to exam…", command=self.goto_exam,
                   width=14).pack(side=tk.LEFT, padx=2)
-        tk.Button(nav2, text="Successivo (senza salvare) ▶", command=self.skip_student,
+        tk.Button(nav2, text="Next (without saving) ▶", command=self.skip_student,
                   width=22).pack(side=tk.RIGHT, padx=2)
-        tk.Button(right, text="Salva e esci", command=self.save_and_exit,
+        tk.Button(right, text="Save and exit", command=self.save_and_exit,
                   width=18, bg="lightgreen").pack(pady=5)
 
-        tk.Label(right, text="Commenti:", font=("Arial", 10, "bold")).pack(anchor="w", padx=5, pady=(10, 0))
+        tk.Label(right, text="Comments:", font=("Arial", 10, "bold")).pack(anchor="w", padx=5, pady=(10, 0))
         self.text_box = scrolledtext.ScrolledText(right, width=45, height=9,
                                                   font=("Arial", 11), wrap="word", undo=True)
         self.text_box.pack(fill="both", expand=True, padx=5, pady=5)
 
         cbf = tk.Frame(right)
         cbf.pack(fill="x", padx=5, pady=(0, 5))
-        for i in range(len(LABELS[False]["quick"])):
-            tk.Button(cbf, text=LABELS[False]["quick"][i][:20],
+        for i in range(len(LABELS[True]["quick"])):
+            tk.Button(cbf, text=LABELS[True]["quick"][i][:20],
                       command=lambda i=i: self.insert_comment(
                           LABELS[self.english_var.get()]["quick"][i])).pack(side=tk.LEFT, padx=2)
-        tk.Button(cbf, text="Copia commento precedente",
+        tk.Button(cbf, text="Copy previous comment",
                   command=self.copy_previous_comment).pack(side=tk.LEFT, padx=2)
 
         # Phrases already used in other exams (double-click to insert)
-        tk.Label(right, text="Frasi già usate (doppio clic per inserire):",
+        tk.Label(right, text="Phrases already used (double-click to insert):",
                  font=("Arial", 10, "bold")).pack(anchor="w", padx=5, pady=(5, 0))
         self.phrase_filter = tk.Entry(right, font=("Arial", 10))
         self.phrase_filter.pack(fill="x", padx=5, pady=(2, 2))
@@ -1798,7 +1904,7 @@ class PDFAnnotatorApp:
         self.previous_comment = ""
 
     def build_score_rows(self, values=None):
-        """(Re)builds the score boxes; values = {question: text} to keep."""
+        """(Re)builds the score boxes; values = {question: (text, is_proposal)} to keep."""
         for w in self.score_frame.winfo_children():
             w.destroy()
         self.score_entries = []
@@ -1806,7 +1912,7 @@ class PDFAnnotatorApp:
             row = tk.Frame(self.score_frame)
             row.pack(fill="x", padx=10, pady=2)
             qmin = self.grades.minimums[qname]
-            rng = f"max {fmt_num(qmax)}" if qmin == 0 else f"da {fmt_num(qmin)} a {fmt_num(qmax)}"
+            rng = f"max {fmt_num(qmax)}" if qmin == 0 else f"{fmt_num(qmin)} to {fmt_num(qmax)}"
             tk.Label(row, text=f"{qname}  ({rng}):", width=18,
                      anchor="w").pack(side=tk.LEFT)
             e = tk.Entry(row, width=8, font=("Arial", 11))
@@ -1821,11 +1927,11 @@ class PDFAnnotatorApp:
             self.score_entries.append(e)
         trow = tk.Frame(self.score_frame)
         trow.pack(fill="x", padx=10, pady=(6, 4))
-        tk.Label(trow, text="Totale:", width=18, anchor="w",
+        tk.Label(trow, text="Total:", width=18, anchor="w",
                  font=("Arial", 10, "bold")).pack(side=tk.LEFT)
         self.total_label = tk.Label(trow, text="0", font=("Arial", 11, "bold"), fg="green")
         self.total_label.pack(side=tk.LEFT)
-        tk.Label(self.score_frame, text="In giallo: proposta da controllare",
+        tk.Label(self.score_frame, text="Yellow: proposal to be checked",
                  bg=PROPOSAL_BG, font=("Arial", 9)).pack(anchor="w", padx=10, pady=(0, 4))
         self.calculate_total()
 
@@ -1841,38 +1947,43 @@ class PDFAnnotatorApp:
         self.calculate_total()
 
     def toggle_english(self):
-        """Switches the language of the evaluation page and of the proposed comment."""
+        """Switches the language of the student pages and of the proposed comment."""
         english = self.english_var.get()
         prop = self.proposal(self.current_number())
         new = self.proposal_comment(prop, english)
         old = self.proposal_comment(prop, not english)
         current = self.text_box.get("1.0", tk.END).strip()
+        language = "English" if english else "Italian"
         if new and current != new:
             if (not current or current == old or messagebox.askyesno(
-                    "Inglese" if english else "Italiano",
-                    "Sostituire il commento con la proposta in "
-                    + ("inglese" if english else "italiano")
-                    + "?\n(le modifiche fatte al commento andranno perse)")):
+                    language, f"Replace the comment with the {language} proposal?\n"
+                              "(your changes to the comment will be lost)")):
                 self.text_box.delete("1.0", tk.END)
                 self.text_box.insert("1.0", new)
                 self.proposal_shown = True
         elif english and not new and prop:
-            messagebox.showinfo("Inglese", "Per questo compito non c'è una proposta di "
-                                "commento in inglese: scrivilo tu.")
+            messagebox.showinfo("English", "There is no English comment proposal for this "
+                                "exam: please write it yourself.")
         name = os.path.basename(self.current_path())
         self.state["files"].setdefault(name, {})["english"] = english
         self.save_state()
+
+    def toggle_english_default(self):
+        """Language of the exams not opened yet; also the current one if never set."""
+        self.save_options()
+        name = os.path.basename(self.current_path())
+        if "english" not in self.state["files"].get(name, {}) \
+                and self.english_var.get() != self.english_default.get():
+            self.english_var.set(self.english_default.get())
+            self.toggle_english()
 
     # --------------------------------------------------
     # State (drawings and comments, per file, in the PDF folder)
     # --------------------------------------------------
 
-    def state_path(self):
-        return os.path.join(self.folder, STATE_NAME)
-
     def load_state(self):
         try:
-            with open(self.state_path(), "r", encoding="utf-8") as f:
+            with open(self.paths["state"], "r", encoding="utf-8") as f:
                 self.state = json.load(f)
             self.state.setdefault("files", {})
         except Exception:
@@ -1883,9 +1994,9 @@ class PDFAnnotatorApp:
             fd, tmp = tempfile.mkstemp(suffix=".json", dir=self.folder)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.state, f)
-            os.replace(tmp, self.state_path())
+            os.replace(tmp, self.paths["state"])
         except Exception as e:
-            print(f"Impossibile salvare lo stato: {e}")
+            print(f"Cannot save the state: {e}")
 
     def remember_current(self):
         """Stores drawings and comments of the current exam (not the scores)."""
@@ -1911,7 +2022,7 @@ class PDFAnnotatorApp:
         return self.pdf_files[self.current_index][1]
 
     def original_path(self, path):
-        return os.path.join(os.path.dirname(path), BACKUP_DIR, os.path.basename(path))
+        return os.path.join(self.paths["originals"], os.path.basename(path))
 
     def source_path(self, path):
         """PDF to display/process: the original if already saved, otherwise the file itself."""
@@ -1927,7 +2038,7 @@ class PDFAnnotatorApp:
                         for k, v in saved.get("strokes", {}).items()}
         self.undo_stack = {}
 
-        english = bool(saved.get("english"))
+        english = self.exam_english(saved)
         self.english_var.set(english)
         self.reload_proposals()
         graded = self.grades.is_graded(n)
@@ -1958,41 +2069,35 @@ class PDFAnnotatorApp:
 
         note = ""
         if prop is not None:
-            note = "Proposta di Claude: controlla punteggi e commento."
+            note = "Proposal: check the scores and the comment."
+            proposed = self.proposal_scores(prop)
             bad = [q[0] for q in self.grades.questions
-                   if q[0] in prop.get("punteggi", {}) and self.proposal_score(prop, q[0]) is None]
+                   if q[0] in proposed and self.proposal_score(prop, q[0]) is None]
             if bad:
-                note += f"\nPunteggi proposti fuori intervallo (ignorati): {', '.join(bad)}"
-            if prop.get("dubbi"):
-                note += f"\n⚠ {prop['dubbi']}"
-        elif not graded:
-            if not self.rubric:
-                note = "Nessuna proposta: manca la griglia di valutazione (pulsante «Griglia…»)."
-            elif not os.path.exists(self.solutions_path()):
-                note = "Nessuna proposta: mancano le soluzioni (pulsante «Soluzioni…»)."
-            elif not self.proposals:
-                note = ("Nessuna proposta ancora: chiedi a Claude di prepararle per questa "
-                        "cartella. Compaiono qui appena sono pronte.")
-            else:
-                note = "Proposta per questo compito non ancora pronta."
+                note += f"\nProposed scores out of range (ignored): {', '.join(bad)}"
+            doubts = prop.get("doubts") or prop.get("dubbi")
+            if doubts:
+                note += f"\n⚠ {doubts}"
+        elif not graded and (self.proposals or os.path.exists(self.paths["proposals"])):
+            note = "No proposal for this exam yet."
         self.label_proposal.config(text=note)
 
         st = self.grades.student(n)
-        self.label_file.config(text=f"Compito {n}  —  {st['cognome']} {st['nome']}")
-        info = f"Matricola: {st['matricola']}\nFile: {name}"
-        if st["note"]:
-            info += f"\nNote: {st['note']}"
+        self.label_file.config(text=f"Exam {n}  —  {st['surname']} {st['name']}")
+        info = f"Student ID: {st['student_id']}\nFile: {name}"
+        if st["notes"]:
+            info += f"\nNotes: {st['notes']}"
         if graded:
-            info += f"\n(già corretto: i punteggi vengono dal file {self.grades.kind})"
+            info += f"\n(already graded: the scores come from the {self.grades.kind} file)"
         self.label_student.config(text=info)
         graded = sum(1 for k, _ in self.pdf_files if self.grades.is_graded(k))
         self.label_status.config(
-            text=f"{self.current_index + 1}/{len(self.pdf_files)}  —  corretti: {graded}")
+            text=f"{self.current_index + 1}/{len(self.pdf_files)}  —  graded: {graded}")
 
         try:
             self.total_pages = len(PdfReader(self.source_path(path)).pages)
         except Exception as e:
-            messagebox.showerror("Errore", f"Impossibile aprire il PDF:\n{e}")
+            messagebox.showerror("Error", f"Cannot open the PDF:\n{e}")
             self.total_pages = 1
         self.current_page = 1
         self.zoom = None
@@ -2013,7 +2118,7 @@ class PDFAnnotatorApp:
                 first_page=self.current_page, last_page=self.current_page,
                 dpi=RENDER_DPI)[0]
         except Exception as e:
-            messagebox.showerror("Errore", f"Impossibile visualizzare il PDF:\n{e}")
+            messagebox.showerror("Error", f"Cannot show the PDF:\n{e}")
             self.page_image = Image.new("RGB", (800, 1100), "white")
         self.show_page()
 
@@ -2179,8 +2284,8 @@ class PDFAnnotatorApp:
 
     def clear_annotations(self):
         if self.strokes.get(str(self.current_page)) and \
-                messagebox.askyesno("Conferma", "Cancellare tutti i disegni di questa pagina?\n"
-                                    "(si può annullare con «Annulla»)"):
+                messagebox.askyesno("Confirm", "Delete all drawings on this page?\n"
+                                    "(you can bring them back with «Undo»)"):
             self._push_undo()
             self.strokes[str(self.current_page)] = []
             self.show_page()
@@ -2194,10 +2299,7 @@ class PDFAnnotatorApp:
             return
         total = 0.0
         for e in self.score_entries:
-            try:
-                total += parse_num(e.get() or "0")
-            except ValueError:
-                pass
+            total += to_float(e.get() or "0") or 0.0
         self.total_label.config(text=f"{fmt_num(total)} / {fmt_num(self.grades.max_total)}")
 
     def focus_next_entry(self, idx):
@@ -2216,7 +2318,7 @@ class PDFAnnotatorApp:
         if self.previous_comment:
             self.insert_comment(self.previous_comment)
         else:
-            messagebox.showinfo("Commento precedente", "Nessun commento nel compito precedente.")
+            messagebox.showinfo("Previous comment", "The previous exam has no comment.")
 
     def refresh_phrases(self):
         """Lists the comment lines used in other exams, most frequent first."""
@@ -2248,20 +2350,18 @@ class PDFAnnotatorApp:
         for e, (qname, _, qmax) in zip(self.score_entries, self.grades.questions):
             txt = e.get().strip()
             if not txt:
-                messagebox.showwarning("Errore", f"Inserisci il punteggio per {qname}")
+                messagebox.showwarning("Error", f"Enter the score for {qname}")
                 e.focus_set()
                 return None
-            try:
-                s = parse_num(txt)
-            except ValueError:
-                messagebox.showwarning("Errore", f"Punteggio non valido per {qname}: '{txt}'")
+            s = to_float(txt)
+            if s is None:
+                messagebox.showwarning("Error", f"Invalid score for {qname}: '{txt}'")
                 e.focus_set()
                 return None
             qmin = self.grades.minimums[qname]
             if s < qmin or s > qmax:
-                messagebox.showwarning("Errore",
-                                       f"{qname}: il punteggio deve essere tra "
-                                       f"{fmt_num(qmin)} e {fmt_num(qmax)}")
+                messagebox.showwarning("Error", f"{qname}: the score must be between "
+                                                f"{fmt_num(qmin)} and {fmt_num(qmax)}")
                 e.focus_set()
                 return None
             scores.append(s)
@@ -2272,7 +2372,7 @@ class PDFAnnotatorApp:
     # --------------------------------------------------
 
     def save_current(self):
-        """Writes the scores to the Excel/CSV file and regenerates the PDF. True on success."""
+        """Writes the scores to the Excel/CSV file and rebuilds the PDF. True on success."""
         scores = self.read_scores()
         if scores is None:
             return False
@@ -2282,9 +2382,9 @@ class PDFAnnotatorApp:
 
         while self.grades.lock_file_exists():
             if not messagebox.askretrycancel(
-                    "File aperto",
-                    f"Il file {kind} è aperto in Excel. Chiudilo (salvando eventuali tue "
-                    "modifiche) e premi Riprova."):
+                    "File open",
+                    f"The {kind} file is open in Excel. Close it (saving your own "
+                    "changes, if any) and press Retry."):
                 return False
 
         self.remember_current()
@@ -2292,7 +2392,7 @@ class PDFAnnotatorApp:
             self.grades.set_scores(n, scores)
             self.grades.save()
         except Exception as e:
-            messagebox.showerror("Errore", f"Impossibile salvare il file {kind}:\n{e}")
+            messagebox.showerror("Error", f"Cannot save the {kind} file:\n{e}")
             return False
         for e in self.score_entries:
             e.config(background=e.default_bg)
@@ -2309,11 +2409,11 @@ class PDFAnnotatorApp:
                              self.text_box.get("1.0", tk.END), self.fonts,
                              english=english, first_page=first, solutions=solutions)
         except Exception as e:
-            messagebox.showerror("Errore",
-                                 f"Punteggi salvati nel file {kind}, ma impossibile salvare il PDF:\n{e}")
+            messagebox.showerror("Error",
+                                 f"Scores saved in the {kind} file, but the PDF could not be saved:\n{e}")
             return False
         if notes:
-            messagebox.showwarning("PDF salvato", "PDF salvato senza:\n- " + "\n- ".join(notes))
+            messagebox.showwarning("PDF saved", "PDF saved without:\n- " + "\n- ".join(notes))
         return True
 
     def go_to(self, index):
@@ -2328,10 +2428,10 @@ class PDFAnnotatorApp:
         if self.current_index + 1 >= len(self.pdf_files):
             missing = [k for k, _ in self.pdf_files if not self.grades.is_graded(k)]
             if missing:
-                messagebox.showinfo("Fine elenco",
-                                    f"Ultimo compito salvato.\nAncora da correggere: {missing}")
+                messagebox.showinfo("End of the list",
+                                    f"Last exam saved.\nStill to grade: {missing}")
             else:
-                messagebox.showinfo("Fine", "Tutti i compiti sono stati corretti!")
+                messagebox.showinfo("Done", "All exams have been graded!")
             self.load_pdf()
             return
         self.go_to(self.current_index + 1)
@@ -2344,18 +2444,18 @@ class PDFAnnotatorApp:
         if self.current_index > 0:
             self.go_to(self.current_index - 1)
 
-    def goto_compito(self):
-        n = simpledialog.askinteger("Vai al compito", "Numero del compito:", parent=self.root)
+    def goto_exam(self):
+        n = simpledialog.askinteger("Go to exam", "Exam number:", parent=self.root)
         if n is None:
             return
         for i, (k, _) in enumerate(self.pdf_files):
             if k == n:
                 self.go_to(i)
                 return
-        messagebox.showwarning("Attenzione", f"Nessun PDF per il compito {n}")
+        messagebox.showwarning("Warning", f"No PDF for exam {n}")
 
     def save_and_exit(self):
-        ans = messagebox.askyesnocancel("Esci", "Salvare il compito corrente prima di uscire?")
+        ans = messagebox.askyesnocancel("Exit", "Save the current exam before exiting?")
         if ans is None:
             return
         if ans and not self.save_current():
